@@ -5,23 +5,23 @@ Windows 下将 SDR 视频转换为 Dolby Vision Profile 8.1（PQ）或 8.4（HLG
 
 ## 安装
 
-需要 Windows 10/11、PowerShell 5.1 或 7，以及以下外部工具：
+需要 Windows 10/11 x64、64 位 PowerShell 5.1 或 7，以及首次部署时的网络连接。
+下载 [最新 Release](https://github.com/gem0816-1/SDR2DV/releases/latest) 的 Windows ZIP，解压后双击 `deploy.bat`。
+部署会复用可用工具，缺少时下载并校验 FFmpeg、dovi_tool、mp4muxer；检测到 NVIDIA 显卡时自动准备 TrueHDR。
+依赖保存在项目目录，不修改系统 PATH，也不启动转换。重复部署复用缓存；仅需普通模式时运行 `deploy.bat -Mode Standard`。
 
-- [FFmpeg](https://ffmpeg.org/download.html)：包含 `ffmpeg`、`ffprobe`，支持 `libx265` 和 `zscale`；已验证 7.1 full。
-- [dovi_tool](https://github.com/quietvoid/dovi_tool/releases)：已验证 2.3.4。
-- [Dolby mp4muxer](https://github.com/DolbyLaboratories/dlb_mp4base)：MP4 和 TrueHDR 模式需要，自行准备 Windows 可执行文件。
-
-将工具加入 `PATH`；也可用 `-DoviTool`、`-Mp4Muxer` 指定后两者。仓库不附带这些工具或 NVIDIA SDK。
+也可从源码部署：
 
 ```powershell
 git clone https://github.com/gem0816-1/SDR2DV.git
 cd SDR2DV
-Set-ExecutionPolicy -Scope Process Bypass
+.\deploy.bat
 ```
 
 ## 使用
 
 ```powershell
+Set-ExecutionPolicy -Scope Process Bypass
 # 普通转换：输出同目录下的 movie_DV81.mp4
 .\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -Preset medium
 
@@ -36,11 +36,11 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ## NVIDIA TrueHDR（可选）
 
-另需 Python 3.11、兼容 NVIDIA GPU/驱动和网络；先核对 [SDK 的硬件及外接显示器条件](https://docs.nvidia.com/maxine/vfx/latest/WindowsVFXSDK/GetStartedonWindows.html)。
-安装脚本创建独立虚拟环境并执行真实推理检查，普通模式不需要 Python 或 NVIDIA GPU。
+另需兼容 NVIDIA GPU/驱动；先核对 [SDK 的硬件及外接显示器条件](https://docs.nvidia.com/maxine/vfx/latest/WindowsVFXSDK/GetStartedonWindows.html)。
+部署自动准备 Python 3.11、独立虚拟环境并执行真实推理检查；普通模式不需要 Python 或 NVIDIA GPU。
 
 ```powershell
-.\SDR2DV\Setup-TrueHDR.ps1
+.\Deploy.ps1 -Mode TrueHDR
 .\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -Preset medium
 ```
 
@@ -56,4 +56,4 @@ Set-ExecutionPolicy -Scope Process Bypass
 - SDR 转 HDR 需要视频重编码；RPU 为采样估计的静态元数据，不等同专业逐镜头 Dolby 调色。目标 1000 nit 不代表屏幕实测亮度。
 - B站的 Dolby Vision / Hi-Res 识别与实际播放需上传后验证，不能仅凭本地元数据保证。
 
-完整参数、音轨兼容处理和转换原理见 [使用说明](docs/usage.md)。
+部署选项和离线缓存见 [部署说明](docs/deployment.md)；完整参数与原理见 [使用说明](docs/usage.md)。

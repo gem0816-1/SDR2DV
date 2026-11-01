@@ -163,7 +163,7 @@ param(
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.7'
+$script:ScriptVersion = '1.8.0'
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -1418,15 +1418,22 @@ try {
     else { Write-Log ('目标 Profile {0} / {1}，SDR 白点映射至 {2} nit' -f $Profile, $script:OutputTransfer, $WhitePoint) }
 
     Write-Log '检查工具链…'
-    $script:Ffmpeg = Resolve-ToolPath -Name 'ffmpeg' -Candidates @() -Hint '请安装 ffmpeg 并加入 PATH。'
-    $script:Ffprobe = Resolve-ToolPath -Name 'ffprobe' -Candidates @() -Hint 'ffprobe 应与 ffmpeg 一起安装。'
-    $script:DoviTool = Resolve-ToolPath -Name 'dovi_tool' -Candidates @($DoviTool, (Join-Path $env:LOCALAPPDATA 'Programs\dovi_tool\dovi_tool.exe')) -Hint '请安装 dovi_tool（https://github.com/quietvoid/dovi_tool/releases）。'
+    $deployedTools = $null
+    $deploymentConfig = Join-Path (Split-Path $PSScriptRoot -Parent) '.tools\tools.json'
+    if (Test-Path -LiteralPath $deploymentConfig) {
+        $deployment = Get-Content -LiteralPath $deploymentConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($deployment.schema -ne 1) { throw '不支持的部署配置，请重新运行 Deploy.ps1。' }
+        $deployedTools = $deployment.tools
+    }
+    $script:Ffmpeg = Resolve-ToolPath -Name 'ffmpeg' -Candidates @($deployedTools.ffmpeg) -Hint '请先运行 deploy.bat，或安装 ffmpeg 并加入 PATH。'
+    $script:Ffprobe = Resolve-ToolPath -Name 'ffprobe' -Candidates @($deployedTools.ffprobe) -Hint '请先运行 deploy.bat，ffprobe 应与 ffmpeg 一起安装。'
+    $script:DoviTool = Resolve-ToolPath -Name 'dovi_tool' -Candidates @($DoviTool, $deployedTools.dovi_tool, (Join-Path $env:LOCALAPPDATA 'Programs\dovi_tool\dovi_tool.exe')) -Hint '请先运行 deploy.bat，或安装 dovi_tool（https://github.com/quietvoid/dovi_tool/releases）。'
 
     $requestedMp4Muxer = $Mp4Muxer
     $script:Mp4Muxer = ''
-    if ($Format -eq 'mp4' -or $Format -eq 'both' -or $HdrMode -eq 'TrueHDR' -or $requestedMp4Muxer -or
+    if ($Format -eq 'mp4' -or $Format -eq 'both' -or $HdrMode -eq 'TrueHDR' -or $requestedMp4Muxer -or $deployedTools.mp4muxer -or
         (Test-Path -LiteralPath (Join-Path $env:USERPROFILE 'Desktop\1\dubi\mp4muxer.exe'))) {
-        $script:Mp4Muxer = Resolve-ToolPath -Name 'mp4muxer' -Candidates @($requestedMp4Muxer, (Join-Path $env:USERPROFILE 'Desktop\1\dubi\mp4muxer.exe')) -Hint 'MP4 模式需要 Dolby mp4muxer，请用 -Mp4Muxer 指定路径，或改用 -Format mkv。'
+        $script:Mp4Muxer = Resolve-ToolPath -Name 'mp4muxer' -Candidates @($requestedMp4Muxer, $deployedTools.mp4muxer, (Join-Path $env:USERPROFILE 'Desktop\1\dubi\mp4muxer.exe')) -Hint '请先运行 deploy.bat，或用 -Mp4Muxer 指定 Dolby mp4muxer 路径。'
     }
 
     Write-Log ('  ffmpeg   : {0}' -f $script:Ffmpeg) 'DIM'

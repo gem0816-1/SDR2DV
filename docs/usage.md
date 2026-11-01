@@ -4,11 +4,11 @@
 
 ## 工具与依赖
 
-`ffmpeg`、`ffprobe` 从 `PATH` 查找；`dovi_tool`、`mp4muxer` 还可分别用 `-DoviTool`、`-Mp4Muxer` 指定。
+优先读取一键部署生成的 `.tools/tools.json`；未部署时从 `PATH` 查找。`dovi_tool`、`mp4muxer` 仍可用 `-DoviTool`、`-Mp4Muxer` 显式覆盖。
 MP4 必须使用 Dolby mp4muxer 先写入 DOVI 配置；TrueHDR 的 MKV 路径也需要它恢复正确视频时间戳。
 普通 MKV 可不依赖 mp4muxer，但封装后仍会检查时长。
 
-TrueHDR 安装脚本默认用 `py -3.11` 创建 `SDR2DV/.venv-truehdr`。可指定 Python：
+一键部署可自动准备项目内的 Python 3.11；独立安装脚本仍可用已有 Python 创建 `SDR2DV/.venv-truehdr`：
 
 ```powershell
 .\SDR2DV\Setup-TrueHDR.ps1 -Python "D:\Python311\python.exe"

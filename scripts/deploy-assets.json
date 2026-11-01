@@ -1,0 +1,22 @@
+{
+  "ffmpeg": {
+    "file": "ffmpeg-7.1-essentials_build.zip",
+    "url": "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build.zip",
+    "sha256": "FA7D4D7E795DB0E2503F49F105F46ED5852386F0CFDD819899BE3B65EBDE24FC"
+  },
+  "dovi_tool": {
+    "file": "dovi_tool-2.3.4-x86_64-pc-windows-msvc.zip",
+    "url": "https://github.com/quietvoid/dovi_tool/releases/download/2.3.4/dovi_tool-2.3.4-x86_64-pc-windows-msvc.zip",
+    "sha256": "0D9733D311DFE49F9DCA0C350F7E6D978182673D333C6F07F7365DAF9E6C81EB"
+  },
+  "mp4muxer": {
+    "file": "mp4muxer-win-x64.zip",
+    "url": "https://github.com/gem0816-1/SDR2DV/releases/download/v1.8.0/mp4muxer-win-x64.zip",
+    "sha256": "9336EA3281BA4C4157816B191D97CD873099664F2E5BEF2BC9C696C068A403A3"
+  },
+  "uv": {
+    "file": "uv-x86_64-pc-windows-msvc.zip",
+    "url": "https://github.com/astral-sh/uv/releases/download/0.13.6/uv-x86_64-pc-windows-msvc.zip",
+    "sha256": "A2A8820D5EEA32F08EF467EF3B7F66883A9B076D5737A2FC2FBB5F458D1BB50F"
+  }
+}

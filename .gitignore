@@ -6,6 +6,10 @@
 .codex/
 .vscode/
 .idea/
+.tools/
+.build/
+/dist/
+*.partial
 
 # Environments and Python caches
 .venv*/
