@@ -26,6 +26,9 @@ SDK 的 Windows 条件见 [官方说明](https://docs.nvidia.com/maxine/vfx/late
 | `-Format` | `mp4` | `mp4` / `mkv` / `both` |
 | `-Profile` | `8.1` | `8.1` 为 PQ，`8.4` 为 HLG |
 | `-HdrMode` | `Original` | `Original` / `TrueHDR` |
+| `-BrightnessMapping` | `Reference` | TrueHDR 亮度风格：`Reference` / `Neutral` |
+| `-BrightnessStrength` | `1` | 参考曲线强度 0..1，0 等同 Neutral |
+| `-SkinToneCorrection` | `0.5` | Reference 暖色去黄强度 0..1；0 关闭 |
 | `-Bilibili` | 关 | 固定 8.4、HLG、目标 28000 kbps、VBV 30000 kbps |
 | `-Preset` | `slow` | x265 预设；`medium` 为质量与速度折中 |
 | `-Crf` | `17` | 质量模式，越低通常越大；与目标码率模式互斥 |
@@ -42,7 +45,7 @@ SDK 的 Windows 条件见 [官方说明](https://docs.nvidia.com/maxine/vfx/late
 | `-Lossless` | 关 | x265 无损编码，体积很大；不表示整个 SDR→DV 流程无损 |
 
 完整帮助：`Get-Help .\SDR2DV\SDR2DV.ps1 -Full`。
-文件夹模式只处理当前层的视频文件，跳过识别出的 `_DV81` / `_DV84` / `_TrueHDR_HDR10` 成片。
+文件夹模式只处理当前层的视频文件，跳过识别出的 `_DV81` / `_DV84` / `_TrueHDR_HDR10` / `_TrueHDR_Ref_HDR10` 成片。
 
 ## TrueHDR 参数与缓存
 
@@ -64,6 +67,28 @@ SDK 使用逐帧内存管道，缓存为最终编码所需 10bit 4:2:0 像素的
 
 工具核验源文件 SHA256、缓存 SHA256 和全部 SDK 参数，不一致会拒绝；外部传入缓存不会被本次清理删除。
 旧 PQ FFV1 缓存也可读取；未保存 HDR10 的缓存不能补出 HDR10 对照文件。
+
+### 参考亮度曲线
+
+TrueHDR 默认使用 `Reference`：SDK 输出先转换成绝对显示线性 RGB，再按亮度应用全片固定的单调曲线，最后转换到 HLG。
+PowerShell、TrueHDR 拖拽入口以及流式/旧 PQ 适配器使用相同默认值：参考曲线强度 1、肤色去黄强度 0.5。
+它是基于参考片亮度特征的创作预设，不是 HDR 标记修改，也不是逐帧自动曝光。黑色仍为零，亮度曲线通过 RGB 同比例缩放保持色度，中高亮展开，高光在 1000 nit 附近柔和收拢。
+随后按色相、饱和度和亮度软选取暖色肤色范围，轻微减绿、补蓝，并归一化保持显示线性亮度。默认强度 0.5，`-SkinToneCorrection 0` 关闭；灰阶与高饱和原色不参与修正。这是颜色范围选择，不识别人脸，相似颜色的物体也可能受影响。
+新转换在 GPU 上、首次 4:2:0 量化之前应用，HDR10 对照也使用同一亮度曲线；参考模式的 HDR10 mastering peak 为 1000 nit。
+`TrueHDRLuminance` 仍控制 SDK 本身，参考曲线的输出参考峰值固定为 1000 nit。曲线强度用于显示线性亮度混合，0 完全旁路。
+
+曲线依据 20 帧分散采样的 1000 nit HLG 参考模型及非近黑区域分位数拟合。参考片超出标称 RGB 信号范围的像素不直接复制为更高峰值，高光保留软肩。
+由于参考与测试 SDR 不是同画面素材，预设对齐的是亮度风格和亮区层次；不同场景的平均亮度不会相同，也不证明实机 Dolby 渲染逐镜头一致。
+
+```powershell
+.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -BrightnessStrength 0.7
+.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -BrightnessMapping Neutral
+```
+
+参考模式使用 `_TrueHDR_Ref_DV84` / `_TrueHDR_Ref_HDR10` 文件名；Neutral 保留原命名，已有成片不会被默认覆盖。
+新缓存记录曲线 ID、哈希、亮度及肤色修正强度，复用时防止重复叠加。已映射缓存只能按原参数复用，不能反向恢复中性画面。
+旧中性 HLG 缓存可在最终编码时用 129³ LUT 应用曲线，避免重跑 AI；这一路径增加一次 RGB/4:2:0 往返及 CPU 滤镜处理，和新转换的 GPU 路径不是逐像素等价。
+旧 PQ FFV1 缓存转换时直接应用 GPU 曲线。两种缓存路径都会重新测量最终基础层，并保留原有 RPU 统计限制。
 
 ## 音频与 Hi-Res
 

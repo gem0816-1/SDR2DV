@@ -4,7 +4,7 @@ Raw frames exist only in RAM/pipes. The cache stores the exact 10-bit 4:2:0
 pixels needed by final x265, not full-film PQ RGB or 16-bit RGB FFV1 files.
 Final two-pass ABR reuses this cache without repeating AI or adding an
 intermediate quantizer. Optional HDR10 is encoded concurrently, never via PQ
-FFV1. Audio remains exclusively in the existing stream-copy muxing stage.
+FFV1. Audio is handled separately by the existing muxing stage.
 """
 import argparse
 import json
@@ -17,7 +17,8 @@ import traceback
 
 import numpy as np
 from truehdr_backend import CREATE_FLAGS, consume, file_hash, read_frame, runtime, source_plan
-from pq_to_hlg import packed_to_hlg, cuda_reference_check
+from pq_to_hlg import rgb_pq_to_nits, rgb_nits_to_hlg, cuda_reference_check
+from brightness_mapping import luminance_lut, map_display_rgb, mapping_info, correct_warm_skin
 
 HLG_TO_YUV = ('zscale=tin=arib-std-b67:pin=bt2020:min=gbr:rin=full:'
               't=arib-std-b67:p=bt2020:m=bt2020nc:r=limited:agamma=0:'
@@ -45,8 +46,9 @@ def encoder_command(args, width, height, fps, output, pq=False):
     params = (f'lossless=1:repeat-headers=1:colorprim=bt2020:transfer={transfer}:'
               'colormatrix=bt2020nc:log-level=error')
     if pq:
+        mastering_peak = 1000 if mapping_info(args.tone_mapping,args.tone_strength,args.skin_strength)['name'] == 'reference' else args.luminance
         params += (':master-display=G(8500,39850)B(6550,2300)R(35400,14600)'
-                   f'WP(15635,16450)L({args.luminance * 10000},1)')
+                   f'WP(15635,16450)L({mastering_peak * 10000},1)')
     command = [args.ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-n',
                '-f', 'rawvideo', '-pixel_format', 'x2bgr10le' if pq else 'gbrp16le',
                '-video_size', f'{width}x{height}', '-framerate', str(fps), '-i', 'pipe:0',
@@ -82,10 +84,13 @@ def convert(args):
     handles = []
     count = limited_count = 0
     start = time.monotonic()
+    tone = mapping_info(args.tone_mapping,args.tone_strength,args.skin_strength)
+    report['brightness_mapping'] = tone
     try:
         print('Checking decoded PTS and SDR colour interpretation...', file=sys.stderr, flush=True)
         video, fps, expected, input_filter = source_plan(args)
         cp, nvvfx = runtime()
+        tone_lut = cp.asarray(luminance_lut()) if tone['name'] == 'reference' else None
         reference_error = cuda_reference_check(cp)
         width, height = video['width'], video['height']
         report.update(binding=nvvfx.__version__, sdk=nvvfx.get_sdk_version(),
@@ -130,10 +135,21 @@ def convert(args):
                 packed = consume(cp, effect.run(gpu).image)
                 if packed.shape != (height, width) or packed.dtype != cp.uint32:
                     raise RuntimeError('Invalid TrueHDR RGB10A2 buffer')
-                planes, limited = packed_to_hlg(cp, packed)
+                rgb_pq = cp.stack([((packed >> shift) & 1023).astype(cp.float32)/1023 for shift in (0,10,20)])
+                display = map_display_rgb(cp,rgb_pq_to_nits(cp,rgb_pq),tone_lut,tone['strength'])
+                display = correct_warm_skin(cp,display,tone['skin_strength'])
+                hlg, limited = rgb_nits_to_hlg(cp,display)
+                planes = cp.rint(cp.clip(hlg[[1,2,0]],0,1)*65535).astype(cp.uint16)
                 limited_count += int(limited.sum().get())
                 hlg_encoder.stdin.write(cp.asnumpy(planes).astype('<u2', copy=False).tobytes())
                 if pq_encoder:
+                    if tone_lut is not None:
+                        pq_display = display/cp.maximum(cp.max(display,axis=0)/1000,1)[None,...]
+                        normalized = cp.maximum(pq_display,0)/10000
+                        p = normalized ** cp.float32(2610/16384)
+                        code = ((3424/4096+(2413/128)*p)/(1+(2392/128)*p)) ** cp.float32(2523/32)
+                        codes = cp.rint(cp.clip(code,0,1)*1023).astype(cp.uint32)
+                        packed = codes[0] | (codes[1] << 10) | (codes[2] << 20) | cp.uint32(3 << 30)
                     pq_encoder.stdin.write(cp.asnumpy(packed).astype('<u4', copy=False).tobytes())
                 count += 1
                 if count % 15 == 0:
@@ -202,6 +218,9 @@ if __name__ == '__main__':
     parser.add_argument('--saturation', type=int, default=100)
     parser.add_argument('--middle-gray', type=int, default=50)
     parser.add_argument('--debanding-off', action='store_true')
+    parser.add_argument('--tone-mapping',choices=['reference','neutral'],default='reference')
+    parser.add_argument('--tone-strength',type=float,default=1.)
+    parser.add_argument('--skin-strength',type=float,default=.5)
     parser.add_argument('-progress', dest='progress')
     parser.add_argument('-nostats', action='store_true')
     args = parser.parse_args()

@@ -37,6 +37,15 @@
 .PARAMETER HdrMode
     Original 保留原转换；TrueHDR 使用官方 NVIDIA SDK，固定输出 P8.4，不叠加原高光曲线。
 
+.PARAMETER BrightnessMapping
+    TrueHDR 亮度曲线：Reference 默认匹配参考片的亮度风格；Neutral 保留旧的 SDK 直接映射。
+
+.PARAMETER BrightnessStrength
+    Reference 曲线强度，0..1，默认 1；0 相当于 Neutral。
+
+.PARAMETER SkinToneCorrection
+    Reference 模式暖色肤色去黄强度，0..1，默认 0.5；0 保持原色。使用柔和色相选择而非人脸检测。
+
 .PARAMETER KeepHDR10
     TrueHDR 模式额外保留独立 HDR10/PQ MP4，音轨遵循 Mp4AudioCodec 策略。
 
@@ -82,6 +91,9 @@
 
 .EXAMPLE
     .\SDR2DV.ps1 -InputPath "D:\movie.mkv" -WhitePoint 100 -Crf 16
+
+.EXAMPLE
+    .\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -Preset medium
 #>
 [CmdletBinding()]
 param(
@@ -112,6 +124,15 @@ param(
     [int]$TrueHDRMiddleGray = 50,
 
     [switch]$TrueHDRDebandingOff,
+
+    [ValidateSet('Reference', 'Neutral')]
+    [string]$BrightnessMapping = 'Reference',
+
+    [ValidateRange(0.0, 1.0)]
+    [double]$BrightnessStrength = 1.0,
+
+    [ValidateRange(0.0, 1.0)]
+    [double]$SkinToneCorrection = 0.5,
 
     [switch]$KeepHDR10,
 
@@ -163,7 +184,7 @@ param(
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.8.0'
+$script:ScriptVersion = '1.9.0'
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -515,6 +536,25 @@ function New-HighlightLut {
 # ---------------------------------------------------------------------------
 # 输入校验与参数提取
 # ---------------------------------------------------------------------------
+function New-ReferenceBrightnessFilter {
+    param([string]$WorkDir, [ValidateSet('hlg', 'pq')][string]$Transfer,
+        [ValidateSet('bt2020nc', 'gbr')][string]$InputMatrix = 'bt2020nc')
+    $cubeName = 'reference_' + $Transfer + '.cube'
+    $cubePath = Join-Path $WorkDir $cubeName
+    if (-not (Test-Path -LiteralPath $cubePath)) {
+        $mappingScript = Join-Path $PSScriptRoot 'brightness_mapping.py'
+        $strength = $BrightnessStrength.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
+        Invoke-NativeQuiet -Exe $script:TrueHDRPython -Arguments @('-B', $mappingScript,
+            '--write-cube', $cubePath, '--transfer', $Transfer, '--strength', $strength,
+            '--skin-strength', $SkinToneCorrection.ToString('R', [Globalization.CultureInfo]::InvariantCulture)) -What '生成参考亮度 LUT'
+    }
+    $trc = 'arib-std-b67'
+    if ($Transfer -eq 'pq') { $trc = 'smpte2084' }
+    $inputRange = 'limited'
+    if ($InputMatrix -eq 'gbr') { $inputRange = 'full' }
+    return ('zscale=tin={0}:pin=bt2020:min={1}:rin={2}:t={0}:p=bt2020:m=gbr:r=full:agamma=0,format=gbrpf32le,lut3d=file={3}:interp=tetrahedral,zscale=tin={0}:pin=bt2020:min=gbr:rin=full:t={0}:p=bt2020:m=bt2020nc:r=limited:agamma=0:dither=error_diffusion,format=yuv420p10le' -f $trc, $InputMatrix, $inputRange, $cubeName)
+}
+
 function Get-IncomingVideoInfo {
     param([string]$Path)
 
@@ -1010,7 +1050,10 @@ function Convert-SingleFile {
 
     $outputs = @()
     $suffix = '_DV' + $Profile.Replace('.', '')
-    if ($HdrMode -eq 'TrueHDR') { $suffix = '_TrueHDR' + $suffix }
+    if ($HdrMode -eq 'TrueHDR') {
+        if ($BrightnessMapping -eq 'Reference' -and $BrightnessStrength -gt 0) { $suffix = '_Ref' + $suffix }
+        $suffix = '_TrueHDR' + $suffix
+    }
     if ($Format -eq 'mp4' -or $Format -eq 'both') {
         $outputs += @{ Kind = 'mp4'; Path = (Join-Path $targetDir ($baseName + $suffix + '.mp4')) }
     }
@@ -1085,15 +1128,30 @@ function Convert-SingleFile {
             $hlgSource = Join-Path $workDir 'truehdr_hlg.mkv'
             $hdr10Video = ''
             $legacyPq = $false
+            $applyCachedBrightness = $false
+            $hdr10NeedsBrightness = $false
+            $toneName = 'neutral'
+            if ($BrightnessMapping -eq 'Reference' -and $BrightnessStrength -gt 0) { $toneName = 'reference' }
+            $toneStrength = $BrightnessStrength.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
+            $skinStrength = $SkinToneCorrection.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
+            $toneInfo = $null
+            $hdr10Suffix = '_TrueHDR_HDR10.mp4'
+            if ($toneName -eq 'reference') { $hdr10Suffix = '_TrueHDR_Ref_HDR10.mp4' }
+            if ($toneName -eq 'reference') {
+                $mappingText = & $script:TrueHDRPython -B (Join-Path $PSScriptRoot 'brightness_mapping.py') --describe --strength $toneStrength --skin-strength $skinStrength
+                if ($LASTEXITCODE -ne 0) { throw '无法读取参考亮度曲线配置。' }
+                $toneInfo = ($mappingText -join "`n") | ConvertFrom-Json
+            }
             if ($KeepHDR10) {
-                $hdr10Target = Join-Path $targetDir ($baseName + '_TrueHDR_HDR10.mp4')
+                $hdr10Target = Join-Path $targetDir ($baseName + $hdr10Suffix)
                 if ((Test-Path -LiteralPath $hdr10Target) -and -not $Force) { throw "HDR10 输出已存在：$hdr10Target" }
             }
             $backendArgs = @('--input', $sourceItem.FullName, '--output', $hlgSource,
                 '--ffmpeg', $script:Ffmpeg, '--ffprobe', $script:Ffprobe,
                 '--report', (Join-Path $workDir 'truehdr-report.json'),
                 '--luminance', [string]$TrueHDRLuminance, '--contrast', [string]$TrueHDRContrast,
-                '--saturation', [string]$TrueHDRSaturation, '--middle-gray', [string]$TrueHDRMiddleGray)
+                '--saturation', [string]$TrueHDRSaturation, '--middle-gray', [string]$TrueHDRMiddleGray,
+                '--tone-mapping', $toneName, '--tone-strength', $toneStrength, '--skin-strength', $skinStrength)
             if ($TrueHDRDebandingOff) { $backendArgs += '--debanding-off' }
             if ($TrueHDRCache) {
                 $cacheArgs = @('-B', $backend, '--verify-cache', $TrueHDRCache, '--input', $sourceItem.FullName,
@@ -1109,8 +1167,20 @@ function Convert-SingleFile {
                     $hlgSource = [string]$cacheInfo.hlg
                     $hdr10Video = [string]$cacheInfo.hdr10
                     if ($KeepHDR10 -and -not $hdr10Video) { throw '该缓存未保留 HDR10。请去掉 -KeepHDR10 续跑，或不指定缓存重新生成 HDR10。' }
+                    $cachedTone = $cacheInfo.brightness_mapping
+                    $cachedName = 'neutral'
+                    if ($cachedTone.name) { $cachedName = $cachedTone.name }
+                    if ($cachedName -eq 'neutral') {
+                        $applyCachedBrightness = ($toneName -eq 'reference')
+                        $hdr10NeedsBrightness = $applyCachedBrightness
+                    }
+                    elseif ($cachedName -ne $toneName -or $cachedTone.strength -ne $BrightnessStrength -or
+                        $cachedTone.skin_strength -ne $SkinToneCorrection -or
+                        $cachedTone.profile_id -ne $toneInfo.profile_id -or $cachedTone.profile_sha256 -ne $toneInfo.profile_sha256) {
+                        throw '缓存的亮度或肤色参数不同；不能再次叠加或撤销。请使用匹配参数，或重新生成缓存。'
+                    }
                 }
-                else { $pqSource = [string]$cacheInfo.pq; $legacyPq = $true }
+                else { $pqSource = [string]$cacheInfo.pq; $legacyPq = $true; $hdr10NeedsBrightness = ($toneName -eq 'reference') }
             }
             else {
                 if ($KeepHDR10) {
@@ -1126,19 +1196,32 @@ function Convert-SingleFile {
             if ($legacyPq) {
                 $hlgArgs = @('--input', $pqSource, '--output', $hlgSource,
                     '--report', (Join-Path $workDir 'pq-to-hlg-report.json'), '--fps', $info.FpsText,
-                    '--frames', [string]$cacheInfo.frames, '--ffmpeg', $script:Ffmpeg, '--ffprobe', $script:Ffprobe)
+                    '--frames', [string]$cacheInfo.frames, '--ffmpeg', $script:Ffmpeg, '--ffprobe', $script:Ffprobe,
+                    '--tone-mapping', $toneName, '--tone-strength', $toneStrength, '--skin-strength', $skinStrength)
                 Invoke-MediaWithProgress -Exe $script:TrueHDRPython -ArgumentPrefix @('-B', (Join-Path $PSScriptRoot 'pq_to_hlg.py')) `
                     -Arguments $hlgArgs -WorkDir $workDir -LogBaseName 'pq_to_hlg' -What 'CUDA PQ→HLG' -Label 'PQ→HLG' -TotalSeconds $info.Duration -ProcessWorkingDirectory $tempRoot
             }
             $encodeSource = $hlgSource
             $encodeZscale = 'null'
+            if ($applyCachedBrightness) {
+                Write-Log '复用旧的中性 HLG 缓存；在编码时应用参考亮度曲线，不重跑 AI。'
+                $encodeZscale = New-ReferenceBrightnessFilter -WorkDir $workDir -Transfer hlg
+            }
+            if ($toneName -eq 'reference') {
+                Write-Log ('参考亮度曲线（强度 {0}）：保留黑位、扩展中高亮、1000 nit 高光柔和收拢；全片固定曲线。' -f $toneStrength)
+                if ($SkinToneCorrection -gt 0) {
+                    Write-Log ('暖色肤色去黄（强度 {0}）：轻微减绿、补蓝并保持亮度；按颜色范围选择。' -f $skinStrength)
+                }
+            }
             Write-Log 'PQ→HLG：1000 nit / gamma 1.2 / 理想黑；亮度相关 OOTF，超出 HLG 色体积时等比限制 RGB。'
             Write-Log 'TrueHDR 不叠加原模式高光曲线；RPU 仍是原有采样估计、全片单段静态元数据。' 'WARN'
             if ($KeepHDR10) {
-                $hdr10Target = Join-Path $targetDir ($baseName + '_TrueHDR_HDR10.mp4')
+                $hdr10Target = Join-Path $targetDir ($baseName + $hdr10Suffix)
                 if ((Test-Path -LiteralPath $hdr10Target) -and -not $Force) { throw "HDR10 输出已存在：$hdr10Target" }
                 $hdr10Work = Join-Path $workDir 'HDR10.mp4'
-                $hdr10Params = ('lossless=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L({0},1):log-level=error' -f (10000 * $TrueHDRLuminance))
+                $hdr10MasteringPeak = $TrueHDRLuminance
+                if ($toneName -eq 'reference') { $hdr10MasteringPeak = 1000 }
+                $hdr10Params = ('lossless=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L({0},1):log-level=error' -f (10000 * $hdr10MasteringPeak))
                 $hdr10Args = @('-hide_banner', '-loglevel', 'warning', '-nostdin', '-y',
                     '-i', $pqSource, '-i', $sourceItem.FullName, '-map', '0:v:0', '-map', '1:a?',
                     '-map_metadata', '1', '-map_chapters', '1', '-vf',
@@ -1152,6 +1235,19 @@ function Convert-SingleFile {
                         '-i', $hdr10Video, '-i', $sourceItem.FullName, '-map', '0:v:0', '-map', '1:a?',
                         '-map_metadata', '1', '-map_chapters', '1', '-c', 'copy', '-tag:v', 'hvc1',
                         '-strict', 'unofficial', '-movflags', '+faststart', $hdr10Work)
+                }
+                if ($hdr10NeedsBrightness) {
+                    $matrix = 'gbr'
+                    $hdr10Input = $pqSource
+                    if ($hdr10Video) { $matrix = 'bt2020nc'; $hdr10Input = $hdr10Video }
+                    $hdr10Filter = New-ReferenceBrightnessFilter -WorkDir $workDir -Transfer pq -InputMatrix $matrix
+                    $hdr10Args = @('-hide_banner', '-loglevel', 'warning', '-nostdin', '-y',
+                        '-i', $hdr10Input, '-i', $sourceItem.FullName, '-map', '0:v:0', '-map', '1:a?',
+                        '-map_metadata', '1', '-map_chapters', '1', '-vf', $hdr10Filter,
+                        '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params', $hdr10Params,
+                        '-fps_mode', 'passthrough', '-tag:v', 'hvc1', '-c:a', 'copy', '-strict', 'unofficial',
+                        '-color_primaries', 'bt2020', '-color_trc', 'smpte2084', '-colorspace', 'bt2020nc',
+                        '-color_range', 'tv', '-movflags', '+faststart', $hdr10Work)
                 }
                 $hdr10AudioPlan = Get-Mp4AudioRemuxPlan -AudioStreams $info.AudioStreams -AudioCodec $Mp4AudioCodec -ForBilibili:$Bilibili
                 $hdr10Args = @($hdr10Args[0..($hdr10Args.Count - 2)]) + @($hdr10AudioPlan.Arguments) + @($hdr10Work)
@@ -1397,7 +1493,9 @@ try {
         $PeakNits = 0
         $script:TrueHDRPython = Resolve-ToolPath -Name '__truehdr_python__' -Candidates @($TrueHDRPython, (Join-Path $PSScriptRoot '.venv-truehdr\Scripts\python.exe')) -Hint '请先运行 Setup-TrueHDR.ps1，或用 -TrueHDRPython 指定独立环境。'
     }
-    elseif ($KeepHDR10 -or $TrueHDRDebandingOff -or @($PSBoundParameters.Keys | Where-Object { $_ -like 'TrueHDR*' }).Count -gt 0) {
+    elseif ($KeepHDR10 -or $TrueHDRDebandingOff -or $PSBoundParameters.ContainsKey('BrightnessMapping') -or
+        $PSBoundParameters.ContainsKey('SkinToneCorrection') -or
+        $PSBoundParameters.ContainsKey('BrightnessStrength') -or @($PSBoundParameters.Keys | Where-Object { $_ -like 'TrueHDR*' }).Count -gt 0) {
         throw 'TrueHDR 参数需要 -HdrMode TrueHDR。'
     }
     if ($VideoBitrate -gt 0) {
@@ -1450,7 +1548,7 @@ try {
     if ($inputItem.PSIsContainer) {
         $files = @(Get-ChildItem -LiteralPath $inputItem.FullName -File -ErrorAction SilentlyContinue |
             Where-Object { $videoExtensions -contains $_.Extension.ToLowerInvariant() } |
-            Where-Object { $_.Name -notmatch '_DV(81|84)\.|_TrueHDR_HDR10\.' } |
+            Where-Object { $_.Name -notmatch '_DV(81|84)\.|_TrueHDR(_Ref)?_HDR10\.' } |
             Sort-Object Name)
         if ($files.Count -eq 0) { throw '文件夹里没有找到可处理的视频文件。' }
         Write-Log ('批量模式：找到 {0} 个文件' -f $files.Count) 'STEP'

@@ -19,7 +19,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 工具和 CUDA 依赖不会添加到系统 PATH；部署不会处理视频、启动播放器或创建计划任务。
 转换脚本从 `.tools/tools.json` 读取经过检查的工具路径；显式 `-DoviTool` / `-Mp4Muxer` 参数优先。
 默认可复用 PATH 中的工具及已有本地工具；`-Portable` 限制为项目内工具，显式提供的路径除外。
-TrueHDR 已有依赖版本正确时跳过安装，执行 `pip check` 和真实推理检查。
+TrueHDR 已有依赖版本正确时跳过安装，执行 `pip check`、参考亮度/肤色模块检查和真实推理检查。
 未找到合适 Python 时，通过固定版本 uv 下载项目内 Python 3.11，不注册 Windows Python、不创建全局命令。
 部署不安装显卡驱动；驱动、GPU、操作系统和显示器需满足 [NVIDIA SDK 条件](https://docs.nvidia.com/maxine/vfx/latest/WindowsVFXSDK/GetStartedonWindows.html)。
 
@@ -64,7 +64,7 @@ Release 同时提供主 ZIP、封装器 ZIP、对应的上游源 ZIP 和 `SHA256
 核对下载包：
 
 ```powershell
-Get-FileHash .\SDR2DV-v1.8.0-win-x64.zip -Algorithm SHA256
+Get-FileHash .\SDR2DV-v1.9.0-win-x64.zip -Algorithm SHA256
 ```
 
 源码回归：`powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Deploy.Tests.ps1`。

@@ -15,6 +15,8 @@ exit /b %result%
 :usage
 echo Drag an SDR video here.
 echo Output: Dolby Vision 8.4, target 28 Mbps. PCM audio: lossless ALAC.
-echo First-time setup: run Setup-TrueHDR.ps1
+echo Reference brightness: 1000 nits. Warm skin correction: 0.5.
+echo Output name: movie_TrueHDR_Ref_DV84.mp4
+echo First-time setup: run ..\deploy.bat -Mode TrueHDR
 pause
 exit /b 1

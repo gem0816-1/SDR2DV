@@ -44,7 +44,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -Preset medium
 ```
 
-也可拖到 `SDR2DV\TrueHDR-DV.bat`。默认目标 1000 nit，输出 `movie_TrueHDR_DV84.mp4`。
+也可拖到 `SDR2DV\TrueHDR-DV.bat`。默认使用参考亮度曲线，目标 1000 nit，输出 `movie_TrueHDR_Ref_DV84.mp4`。
+`-BrightnessStrength 0.7` 可减弱曲线；`-BrightnessMapping Neutral` 使用旧的 SDK 直接映射。
+参考模式默认以 `0.5` 强度轻微修正暖色肤色的偏黄；`-SkinToneCorrection 0` 关闭该修正。
 
 ## 配置与限制
 

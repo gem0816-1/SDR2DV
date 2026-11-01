@@ -49,6 +49,7 @@ def verify_cache(args):
                 raise ValueError('TrueHDR HDR10 cache SHA256 mismatch')
             hdr10_path = str(hdr10)
         return dict(verified=True, kind=report['cache_kind'], hlg=str(hlg), hdr10=hdr10_path,
+                    brightness_mapping=report.get('brightness_mapping',dict(name='neutral',strength=0.)),
                     manifest=str(manifest), frames=report['frames'], sdk=report['sdk'])
     pq = manifest.parent / 'truehdr_pq.mkv'
     if report.get('pq_file_sha256') != file_hash(pq):

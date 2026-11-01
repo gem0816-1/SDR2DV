@@ -4,6 +4,11 @@ param([string]$Python = '', [switch]$CheckOnly)
 $ErrorActionPreference = 'Stop'
 $venvPython = Join-Path $PSScriptRoot '.venv-truehdr\Scripts\python.exe'
 try {
+    foreach ($module in @('brightness_mapping.py', 'hdr_math.py', 'pq_to_hlg.py', 'truehdr_backend.py', 'truehdr_stream.py')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $module) -PathType Leaf)) {
+            throw "Incomplete TrueHDR package: missing $module. Extract the complete release ZIP again."
+        }
+    }
     if (-not (Test-Path -LiteralPath $venvPython)) {
         if ($CheckOnly) { throw 'TrueHDR local environment is missing. Run Setup-TrueHDR.ps1 first.' }
         if ($Python) { & $Python -m venv (Join-Path $PSScriptRoot '.venv-truehdr') }
@@ -29,6 +34,8 @@ try {
     else { Write-Host 'Reuse pinned TrueHDR environment; no installation needed.' }
     & $venvPython -m pip check
     if ($LASTEXITCODE -ne 0) { throw 'Python dependency check failed.' }
+    & $venvPython -B (Join-Path $PSScriptRoot 'brightness_mapping.py') --describe
+    if ($LASTEXITCODE -ne 0) { throw 'Reference brightness/skin correction module check failed.' }
     & $venvPython -B (Join-Path $PSScriptRoot 'truehdr_backend.py') --check
     if ($LASTEXITCODE -ne 0) { throw 'TrueHDR inference check failed. See the original SDK error above.' }
 }

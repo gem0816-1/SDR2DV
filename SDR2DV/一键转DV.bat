@@ -15,10 +15,11 @@ if %errorlevel%==0 (
 ) else (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0SDR2DV.ps1" -InputPath "%~1"
 )
+set "result=%errorlevel%"
 
 echo.
 pause
-exit /b 0
+exit /b %result%
 
 :usage
 echo.
@@ -27,7 +28,7 @@ echo    SDR to Dolby Vision 8.1   one-click converter
 echo  ============================================================
 echo.
 echo    Usage 1: drag an SDR video file (or a folder) onto this .bat
-echo    Usage 2: run in cmd:  SDR2DV.bat "D:\movie.mkv"
+echo    PowerShell: .\SDR2DV.ps1 -InputPath "D:\movie.mkv"
 echo.
 echo    Default output: xxx_DV81.mp4 next to the source
 echo    Need MKV (keep all audio/subtitles): run SDR2DV.ps1 -Format both

@@ -1,7 +1,8 @@
 """Exact BT.2100 display-reference conversion on CUDA, bounded one-frame buffers.
 
 1000-nit ideal-black HLG display, gamma 1.2. Uniform RGB scaling at the HLG
-colour-volume boundary; no second creative tone map. 16-bit HLG RGB is piped
+colour-volume boundary, with an optional reference brightness/colour preset.
+16-bit HLG RGB is piped
 through the single 4:2:0 conversion into a lossless Main10 cache.
 """
 import argparse
@@ -12,6 +13,7 @@ import time
 import numpy as np
 from hdr_math import display_to_hlg
 from truehdr_backend import CREATE_FLAGS, read_frame
+from brightness_mapping import luminance_lut, map_display_rgb, mapping_info, correct_warm_skin
 
 
 def rgb_nits_to_hlg(cp, d):
@@ -25,15 +27,20 @@ def rgb_nits_to_hlg(cp, d):
     return code, maximum > 1 + 1e-6
 
 
-def packed_to_hlg(cp, packed):
+def packed_to_hlg(cp, packed, mapping_lut=None, strength=1.):
     rgb = cp.stack([((packed >> shift) & 1023).astype(cp.float32) / 1023 for shift in (0,10,20)])
-    return rgb_pq_to_hlg(cp, rgb)
+    return rgb_pq_to_hlg(cp, rgb, mapping_lut, strength)
 
 
-def rgb_pq_to_hlg(cp, rgb):
+def rgb_pq_to_nits(cp, rgb):
     p = rgb ** cp.float32(1/78.84375)
-    nits = cp.float32(10000) * (cp.maximum(p-.8359375,0) /
+    return cp.float32(10000) * (cp.maximum(p-.8359375,0) /
                               cp.maximum(18.8515625-18.6875*p,cp.float32(1e-12))) ** cp.float32(1/.1593017578125)
+
+
+def rgb_pq_to_hlg(cp, rgb, mapping_lut=None, strength=1., skin_strength=0.):
+    nits = map_display_rgb(cp,rgb_pq_to_nits(cp,rgb),mapping_lut,strength)
+    nits = correct_warm_skin(cp,nits,skin_strength)
     code, limited = rgb_nits_to_hlg(cp, nits)
     # Raw planar GBR ordering, full-range 16-bit UNORM, no colour tag substitution.
     planes = cp.rint(cp.clip(code[[1,2,0]], 0, 1)*65535).astype(cp.uint16)
@@ -55,6 +62,8 @@ def cuda_reference_check(cp):
 def convert(args):
     import cupy as cp
     error = cuda_reference_check(cp)
+    tone = mapping_info(args.tone_mapping,args.tone_strength,args.skin_strength)
+    tone_lut = cp.asarray(luminance_lut()) if tone['name'] == 'reference' else None
     media = json.loads(subprocess.check_output([args.ffprobe, '-v','error','-show_streams','-of','json',args.input]))
     v = media['streams'][0]
     if v['pix_fmt'] != 'gbrp10le' or v['codec_name'] != 'ffv1':
@@ -77,7 +86,7 @@ def convert(args):
     report=dict(reference_peak_nits=1000,black_nits=0,system_gamma=1.2,
                 cuda_vs_float64_reference_max_signal_error=error,
                 algorithm='PQ EOTF; luminance-dependent inverse HLG OOTF; uniform colour-volume limit; HLG OETF',
-                input=args.input,output=args.output,decode_command=dec,encode_command=enc)
+                input=args.input,output=args.output,decode_command=dec,encode_command=enc,brightness_mapping=tone)
     try:
         with open(out.with_suffix('.decode.log'),'wb') as de,open(out.with_suffix('.encode.log'),'wb') as ee:
             p=subprocess.Popen(dec,stdout=subprocess.PIPE,stderr=de,creationflags=CREATE_FLAGS)
@@ -90,7 +99,7 @@ def convert(args):
                 # format conversion; reorder only G,B,R -> R,G,B on CUDA.
                 planar=cp.asarray(np.frombuffer(raw,'<u2').reshape(3,h,w))
                 rgb=planar[[2,0,1]].astype(cp.float32)/1023
-                planes,limited=rgb_pq_to_hlg(cp,rgb)
+                planes,limited=rgb_pq_to_hlg(cp,rgb,tone_lut,tone['strength'],tone['skin_strength'])
                 limited_count+=int(limited.sum().get())
                 q.stdin.write(cp.asnumpy(planes).astype('<u2',copy=False).tobytes())
                 count+=1
@@ -123,6 +132,9 @@ if __name__=='__main__':
     parser.add_argument('--frames',required=True,type=int)
     parser.add_argument('--ffmpeg',default='ffmpeg')
     parser.add_argument('--ffprobe',default='ffprobe')
+    parser.add_argument('--tone-mapping',choices=['reference','neutral'],default='reference')
+    parser.add_argument('--tone-strength',type=float,default=1.)
+    parser.add_argument('--skin-strength',type=float,default=.5)
     parser.add_argument('-progress',dest='progress')
     parser.add_argument('-nostats',action='store_true')
     convert(parser.parse_args())
