@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.txt text eol=lf
+
+# Preserve UTF-8 BOM in PS1 and ASCII+CRLF BAT bytes in clones and ZIP downloads.
+*.ps1 -text
+*.bat -text

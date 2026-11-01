@@ -1,0 +1,216 @@
+"""Bounded SDR -> NVIDIA TrueHDR -> HLG -> lossless Main10 cache pipeline.
+
+Raw frames exist only in RAM/pipes. The cache stores the exact 10-bit 4:2:0
+pixels needed by final x265, not full-film PQ RGB or 16-bit RGB FFV1 files.
+Final two-pass ABR reuses this cache without repeating AI or adding an
+intermediate quantizer. Optional HDR10 is encoded concurrently, never via PQ
+FFV1. Audio remains exclusively in the existing stream-copy muxing stage.
+"""
+import argparse
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+
+import numpy as np
+from truehdr_backend import CREATE_FLAGS, consume, file_hash, read_frame, runtime, source_plan
+from pq_to_hlg import packed_to_hlg, cuda_reference_check
+
+HLG_TO_YUV = ('zscale=tin=arib-std-b67:pin=bt2020:min=gbr:rin=full:'
+              't=arib-std-b67:p=bt2020:m=bt2020nc:r=limited:agamma=0:'
+              'dither=error_diffusion,format=yuv420p10le')
+PQ_TO_YUV = ('format=gbrp10le,zscale=tin=smpte2084:pin=bt2020:min=gbr:rin=full:'
+             't=smpte2084:p=bt2020:m=bt2020nc:r=limited:agamma=0,format=yuv420p10le')
+
+
+def required_remaining_bytes(cache_bytes, hdr10_bytes, completed, total):
+    """Rolling estimate, not a worst-case compression guarantee.
+
+    Reserve an additional copy of optional HDR10 for its audio remux, plus
+    4 GiB for final encoding/mux/verification. A 30% margin covers sampling and
+    encoder buffering; continuous low-space checks remain mandatory.
+    """
+    if completed <= 0:
+        return 4 * 1024**3
+    growth = (cache_bytes + hdr10_bytes) * max(total - completed, 0) / completed
+    hdr10_remux = hdr10_bytes * total / completed
+    return int(1.3 * (growth + hdr10_remux) + 4 * 1024**3)
+
+
+def encoder_command(args, width, height, fps, output, pq=False):
+    transfer = 'smpte2084' if pq else 'arib-std-b67'
+    params = (f'lossless=1:repeat-headers=1:colorprim=bt2020:transfer={transfer}:'
+              'colormatrix=bt2020nc:log-level=error')
+    if pq:
+        params += (':master-display=G(8500,39850)B(6550,2300)R(35400,14600)'
+                   f'WP(15635,16450)L({args.luminance * 10000},1)')
+    command = [args.ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-n',
+               '-f', 'rawvideo', '-pixel_format', 'x2bgr10le' if pq else 'gbrp16le',
+               '-video_size', f'{width}x{height}', '-framerate', str(fps), '-i', 'pipe:0',
+               '-an', '-vf', PQ_TO_YUV if pq else HLG_TO_YUV, '-fps_mode', 'passthrough',
+               '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params', params,
+               '-color_primaries', 'bt2020', '-color_trc', transfer, '-colorspace', 'bt2020nc',
+               '-color_range', 'tv', '-flush_packets', '1']
+    if pq:
+        command += ['-tag:v', 'hvc1']
+    return command + [str(output)]
+
+
+def convert(args):
+    # Mark a running/failed pipeline explicitly; only completed, hashed caches
+    # can be reused or preserved by PowerShell's failure cleanup.
+    output = Path(args.output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        raise FileExistsError(output)
+    hdr10 = Path(args.hdr10_output).resolve() if args.hdr10_output else None
+    if hdr10 and hdr10.exists():
+        raise FileExistsError(hdr10)
+    report_path = Path(args.report).resolve()
+    report = dict(cache_kind='hlg-yuv420p10-lossless-v1', cache_ready=False, success=False,
+                  input=str(Path(args.input).resolve()), output=str(output),
+                  parameters={name: getattr(args, name) for name in
+                              ('luminance', 'contrast', 'saturation', 'middle_gray', 'debanding_off')},
+                  reference_peak_nits=1000, hlg_system_gamma=1.2,
+                  intermediate_pixel_format='yuv420p10le', intermediate_lossless=True,
+                  raw_video_files_created=False)
+    report_path.write_text(json.dumps(report, indent=2), encoding='utf-8')
+    decoder = hlg_encoder = pq_encoder = None
+    handles = []
+    count = limited_count = 0
+    start = time.monotonic()
+    try:
+        print('Checking decoded PTS and SDR colour interpretation...', file=sys.stderr, flush=True)
+        video, fps, expected, input_filter = source_plan(args)
+        cp, nvvfx = runtime()
+        reference_error = cuda_reference_check(cp)
+        width, height = video['width'], video['height']
+        report.update(binding=nvvfx.__version__, sdk=nvvfx.get_sdk_version(),
+                      fps=str(fps), input_frames=expected, input_filter=input_filter,
+                      input_sha256=file_hash(args.input),
+                      cuda_reference_max_signal_error=reference_error)
+        decode = [args.ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-noautorotate',
+                  '-i', args.input, '-map', '0:v:0', '-an', '-sn', '-dn', '-vf', input_filter,
+                  '-fps_mode', 'passthrough', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
+        encode = encoder_command(args, width, height, fps, output)
+        report.update(decode_command=decode, hlg_encode_command=encode)
+
+        def logfile(name):
+            handle = open(output.parent / name, 'wb')
+            handles.append(handle)
+            return handle
+
+        decoder = subprocess.Popen(decode, stdout=subprocess.PIPE,
+                                   stderr=logfile('stream_decode.log'), creationflags=CREATE_FLAGS)
+        hlg_encoder = subprocess.Popen(encode, stdin=subprocess.PIPE,
+                                       stderr=logfile('stream_hlg_encode.log'), creationflags=CREATE_FLAGS)
+        if hdr10:
+            pq_command = encoder_command(args, width, height, fps, hdr10, pq=True)
+            report['hdr10_encode_command'] = pq_command
+            pq_encoder = subprocess.Popen(pq_command, stdin=subprocess.PIPE,
+                                          stderr=logfile('stream_hdr10_encode.log'), creationflags=CREATE_FLAGS)
+        print('NVIDIA TrueHDR -> CUDA PQ/HLG -> lossless Main10 cache (pipes only).',
+              file=sys.stderr, flush=True)
+        last_storage = {}
+        with nvvfx.TrueHDR(luminance=args.luminance, contrast=args.contrast,
+                          saturation=args.saturation, middle_gray=args.middle_gray,
+                          debanding_off=int(args.debanding_off)) as effect:
+            effect.load()
+            while True:
+                frame = read_frame(decoder.stdout, width * height * 3)
+                if not frame:
+                    break
+                host = np.frombuffer(frame, np.uint8).reshape(height, width, 3)
+                gpu = cp.ascontiguousarray(cp.asarray(host).transpose(2, 0, 1), dtype=cp.float32)
+                gpu *= cp.float32(1 / 255)
+                cp.cuda.Device().synchronize()
+                packed = consume(cp, effect.run(gpu).image)
+                if packed.shape != (height, width) or packed.dtype != cp.uint32:
+                    raise RuntimeError('Invalid TrueHDR RGB10A2 buffer')
+                planes, limited = packed_to_hlg(cp, packed)
+                limited_count += int(limited.sum().get())
+                hlg_encoder.stdin.write(cp.asnumpy(planes).astype('<u2', copy=False).tobytes())
+                if pq_encoder:
+                    pq_encoder.stdin.write(cp.asnumpy(packed).astype('<u4', copy=False).tobytes())
+                count += 1
+                if count % 15 == 0:
+                    cache_bytes = output.stat().st_size if output.exists() else 0
+                    pq_bytes = hdr10.stat().st_size if hdr10 and hdr10.exists() else 0
+                    free = shutil.disk_usage(output.parent).free
+                    estimate = required_remaining_bytes(cache_bytes, pq_bytes, count, expected)
+                    last_storage = dict(frame=count, free_bytes=free, cache_bytes=cache_bytes,
+                                        hdr10_bytes=pq_bytes, estimated_remaining_bytes=estimate)
+                    if count % 60 == 0:
+                        report.update(frames=count, storage=last_storage,
+                                      elapsed_seconds=time.monotonic()-start)
+                        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+                    if args.progress:
+                        Path(args.progress).write_text(
+                            f'frame={count}\nout_time_us={int(count / float(fps) * 1e6)}\n'
+                            f'cache_bytes={cache_bytes}\n', encoding='ascii')
+                    if free < 1024**3:
+                        raise RuntimeError('Temporary disk has less than 1 GiB free')
+                    if count >= max(90, int(float(fps) * 5)) and free < estimate:
+                        raise RuntimeError(f'Early storage check: estimated {estimate / 1024**3:.1f} GiB '
+                                           f'remaining including outputs, only {free / 1024**3:.1f} GiB free')
+        hlg_encoder.stdin.close()
+        if pq_encoder:
+            pq_encoder.stdin.close()
+        decode_code = decoder.wait()
+        hlg_code = hlg_encoder.wait()
+        if not decode_code and not hlg_code and count == expected:
+            report.update(cache_ready=True, frames=count, hlg_file_sha256=file_hash(output),
+                          cache_bytes=output.stat().st_size)
+        if decode_code or hlg_code or count != expected:
+            raise RuntimeError(f'Stream failure: decoder={decode_code}, HLG={hlg_code}, '
+                               f'frames={count}/{expected}; see stream logs')
+        if pq_encoder:
+            if pq_encoder.wait():
+                raise RuntimeError('HDR10 encoder failed; completed HLG cache can be reused')
+            report.update(hdr10_file_sha256=file_hash(hdr10), hdr10_bytes=hdr10.stat().st_size)
+        report.update(success=True, colour_volume_limited_fraction=limited_count/(count*width*height),
+                      storage=last_storage, elapsed_seconds=time.monotonic()-start)
+        if args.progress:
+            Path(args.progress).write_text(f'frame={count}\nout_time_us={int(count / float(fps) * 1e6)}\nprogress=end\n')
+    except BaseException as error:
+        report.update(error=f'{type(error).__name__}: {error}', traceback=traceback.format_exc(), frames=count)
+        raise
+    finally:
+        for child in (decoder, hlg_encoder, pq_encoder):
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.wait()
+        for handle in handles:
+            handle.close()
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(json.dumps({key: report[key] for key in ('frames','cache_bytes','elapsed_seconds','cache_ready')}, indent=2))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input', required=True)
+    parser.add_argument('--output', required=True)
+    parser.add_argument('--report', required=True)
+    parser.add_argument('--hdr10-output')
+    parser.add_argument('--ffmpeg', default='ffmpeg')
+    parser.add_argument('--ffprobe', default='ffprobe')
+    parser.add_argument('--luminance', type=int, default=1000)
+    parser.add_argument('--contrast', type=int, default=100)
+    parser.add_argument('--saturation', type=int, default=100)
+    parser.add_argument('--middle-gray', type=int, default=50)
+    parser.add_argument('--debanding-off', action='store_true')
+    parser.add_argument('-progress', dest='progress')
+    parser.add_argument('-nostats', action='store_true')
+    args = parser.parse_args()
+    for name, low, high in [('luminance',400,2000),('contrast',0,200),
+                            ('saturation',0,200),('middle_gray',10,100)]:
+        if not low <= getattr(args,name) <= high:
+            parser.error(f'{name} must be {low}..{high}')
+    try:
+        convert(args)
+    except Exception as error:
+        print(f'TrueHDR streaming failed: {type(error).__name__}: {error}', file=sys.stderr)
+        sys.exit(1)
