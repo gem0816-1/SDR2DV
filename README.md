@@ -41,7 +41,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ```powershell
 .\Deploy.ps1 -Mode TrueHDR
-.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -Preset medium
+.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -Encoder NVENC
 ```
 
 也可拖到 `SDR2DV\TrueHDR-DV.bat`。默认使用参考亮度曲线，目标 1000 nit，输出 `movie_TrueHDR_Ref_DV84.mp4`。
@@ -51,11 +51,13 @@ Set-ExecutionPolicy -Scope Process Bypass
 ## 配置与限制
 
 - `-OutputDir` 指定输出目录，`-Force` 覆盖已有成片；`-Mp4Muxer "D:\tools\mp4muxer.exe"` 指定封装工具。
+- `-Encoder Auto` 默认在 8.4 且硬件检查通过时使用 NVENC P6 HQ；强制 `NVENC` 失败会报错，`x265` 保留软件编码。`-NvencPreset` / `-NvencCq` 控制 NVENC 预设与质量；`-Preset` / `-Crf` 用于 x265。
 - B站 MP4 默认将 16/24bit 整数 PCM 无损编码为 ALAC，保留采样值、采样率、位深和声道；其他音轨、普通模式及 MKV 直接复制。`-Mp4AudioCodec copy` 可强制原编码复制。
 - 默认成功或失败均清理本次缓存、日志和中间文件，保留源视频与已校验成片；`-KeepTemp` 主动保留排错文件。强制结束或断电无法保证清理。
 - TrueHDR 缓存可能很大，需预留临时空间；输入须有明确 SDR 色彩标记、连续固定帧率、零起始 PTS、偶数尺寸、方形像素且无旋转。
 - 已是 HDR 的输入会被拒绝；MP4 不保留字幕，MKV 保留。ALAC 路径不自动降低 32bit/浮点 PCM 的规格或混音，不支持时会报错。
 - SDR 转 HDR 需要视频重编码；RPU 为采样估计的静态元数据，不等同专业逐镜头 Dolby 调色。目标 1000 nit 不代表屏幕实测亮度。
+- NVENC 当前支持 8.4 / HLG；8.1、可选 HDR10 对照保留 x265。NVENC 的逐帧多遍分析与 x265 整片两遍编码不同，画质和码率分配可能不同。
 - B站的 Dolby Vision / Hi-Res 识别与实际播放需上传后验证，不能仅凭本地元数据保证。
 
 部署选项和离线缓存见 [部署说明](docs/deployment.md)；完整参数与原理见 [使用说明](docs/usage.md)。

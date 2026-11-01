@@ -74,11 +74,10 @@ def convert(args):
         raise FileExistsError(out)
     dec=[args.ffmpeg,'-hide_banner','-v','error','-nostdin','-i',args.input,'-an',
          '-pix_fmt','gbrp10le','-fps_mode','passthrough','-f','rawvideo','pipe:1']
-    from truehdr_stream import HLG_TO_YUV
+    from truehdr_stream import HLG_TO_YUV, cache_encoding_args
     enc=[args.ffmpeg,'-hide_banner','-v','error','-nostdin','-n','-f','rawvideo',
          '-pixel_format','gbrp16le','-video_size',f'{w}x{h}','-framerate',args.fps,'-i','pipe:0',
-         '-an','-vf',HLG_TO_YUV,'-c:v','libx265','-preset','ultrafast',
-         '-x265-params','lossless=1:repeat-headers=1:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:log-level=error',
+         '-an','-vf',HLG_TO_YUV] + cache_encoding_args(args.cache_encoder) + [
          '-color_primaries','bt2020','-color_trc','arib-std-b67','-colorspace','bt2020nc','-color_range','tv',str(out)]
     p=q=None
     count=limited_count=0
@@ -86,7 +85,8 @@ def convert(args):
     report=dict(reference_peak_nits=1000,black_nits=0,system_gamma=1.2,
                 cuda_vs_float64_reference_max_signal_error=error,
                 algorithm='PQ EOTF; luminance-dependent inverse HLG OOTF; uniform colour-volume limit; HLG OETF',
-                input=args.input,output=args.output,decode_command=dec,encode_command=enc,brightness_mapping=tone)
+                input=args.input,output=args.output,decode_command=dec,encode_command=enc,
+                brightness_mapping=tone,cache_encoder=args.cache_encoder)
     try:
         with open(out.with_suffix('.decode.log'),'wb') as de,open(out.with_suffix('.encode.log'),'wb') as ee:
             p=subprocess.Popen(dec,stdout=subprocess.PIPE,stderr=de,creationflags=CREATE_FLAGS)
@@ -135,6 +135,7 @@ if __name__=='__main__':
     parser.add_argument('--tone-mapping',choices=['reference','neutral'],default='reference')
     parser.add_argument('--tone-strength',type=float,default=1.)
     parser.add_argument('--skin-strength',type=float,default=.5)
+    parser.add_argument('--cache-encoder',choices=['nvenc','x265'],default='nvenc')
     parser.add_argument('-progress',dest='progress')
     parser.add_argument('-nostats',action='store_true')
     convert(parser.parse_args())

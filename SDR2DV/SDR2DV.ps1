@@ -6,7 +6,7 @@
 .DESCRIPTION
     流水线：
       1) SDR 标准映射或可选高光扩展，保留中低亮度基准
-      2) SDR → PQ 或 HLG（BT.2020）10bit，CRF 或两遍目标码率 x265 编码
+      2) SDR → PQ 或 HLG（BT.2020）10bit，NVENC 硬件或 x265 软件编码
       3) 按 PQ 域采样生成 RPU；CM v4.0 限制平均值下限，L6 MaxFALL 仍为近似
       4) 把 RPU 注入 HEVC
       5) 封装：MP4 用 Dolby mp4muxer（写入 DOVI 配置记录）；MKV 用 ffmpeg（音轨/字幕全保留）
@@ -58,11 +58,21 @@
 .PARAMETER Preset
     x265 预设，默认 slow（质量优先）。嫌慢可改 medium / fast。
 
+.PARAMETER Encoder
+    Auto 默认在 Profile 8.4 且 NVENC 实测可用时启用硬件编码；否则使用 x265。
+    NVENC 强制使用 NVIDIA 10bit HEVC，初始化失败会报错；x265 显式使用软件编码。
+
+.PARAMETER NvencPreset
+    NVENC 预设 p1..p7，默认 p6；仅 NVENC 使用。
+
+.PARAMETER NvencCq
+    NVENC 无目标码率时的 CQ，默认 18；和 x265 CRF 不是同一质量尺度。
+
 .PARAMETER Crf
-    x265 质量，默认 17（越低越好越大）。16~18 是常用区间。
+    x265 质量，默认 17（越低越好越大）。NVENC 请用 NvencCq。
 
 .PARAMETER Lossless
-    x265 无损编码（体积巨大，仅测试/收藏用）。
+    所选编码器的无损模式（体积巨大，仅测试/收藏用）。
 
 .PARAMETER Mp4AudioCodec
     默认 auto：B站将 16/24bit 整数 PCM 无损改封为 ALAC，其余原样复制。
@@ -157,6 +167,15 @@ param(
     [ValidateSet('ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow')]
     [string]$Preset = 'slow',
 
+    [ValidateSet('Auto', 'NVENC', 'x265')]
+    [string]$Encoder = 'Auto',
+
+    [ValidateSet('p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7')]
+    [string]$NvencPreset = 'p6',
+
+    [ValidateRange(0, 51)]
+    [int]$NvencCq = 18,
+
     [ValidateRange(0, 51)]
     [int]$Crf = 17,
 
@@ -184,7 +203,8 @@ param(
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.9.0'
+$script:ScriptVersion = '1.10.0'
+. (Join-Path $PSScriptRoot 'encoding.ps1')
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -1152,6 +1172,7 @@ function Convert-SingleFile {
                 '--luminance', [string]$TrueHDRLuminance, '--contrast', [string]$TrueHDRContrast,
                 '--saturation', [string]$TrueHDRSaturation, '--middle-gray', [string]$TrueHDRMiddleGray,
                 '--tone-mapping', $toneName, '--tone-strength', $toneStrength, '--skin-strength', $skinStrength)
+            $backendArgs += @('--cache-encoder', $Encoder.ToLowerInvariant())
             if ($TrueHDRDebandingOff) { $backendArgs += '--debanding-off' }
             if ($TrueHDRCache) {
                 $cacheArgs = @('-B', $backend, '--verify-cache', $TrueHDRCache, '--input', $sourceItem.FullName,
@@ -1187,7 +1208,7 @@ function Convert-SingleFile {
                     $hdr10Video = Join-Path $workDir 'HDR10_video.mp4'
                     $backendArgs += @('--hdr10-output', $hdr10Video)
                 }
-                Write-Log 'NVIDIA TrueHDR → PQ→HLG 逐帧管道；保存 Main10 无损压缩缓存，供两遍编码复用…'
+                Write-Log ('NVIDIA TrueHDR → PQ→HLG 逐帧管道；使用 {0} 保存 Main10 无损缓存…' -f $Encoder)
                 # Keep the SDK's working directory outside the per-run folder:
                 # Windows can retain that directory handle after inference.
                 Invoke-MediaWithProgress -Exe $script:TrueHDRPython -ArgumentPrefix @('-B', (Join-Path $PSScriptRoot 'truehdr_stream.py')) -Arguments $backendArgs -WorkDir $workDir `
@@ -1197,7 +1218,8 @@ function Convert-SingleFile {
                 $hlgArgs = @('--input', $pqSource, '--output', $hlgSource,
                     '--report', (Join-Path $workDir 'pq-to-hlg-report.json'), '--fps', $info.FpsText,
                     '--frames', [string]$cacheInfo.frames, '--ffmpeg', $script:Ffmpeg, '--ffprobe', $script:Ffprobe,
-                    '--tone-mapping', $toneName, '--tone-strength', $toneStrength, '--skin-strength', $skinStrength)
+                    '--tone-mapping', $toneName, '--tone-strength', $toneStrength, '--skin-strength', $skinStrength,
+                    '--cache-encoder', $Encoder.ToLowerInvariant())
                 Invoke-MediaWithProgress -Exe $script:TrueHDRPython -ArgumentPrefix @('-B', (Join-Path $PSScriptRoot 'pq_to_hlg.py')) `
                     -Arguments $hlgArgs -WorkDir $workDir -LogBaseName 'pq_to_hlg' -What 'CUDA PQ→HLG' -Label 'PQ→HLG' -TotalSeconds $info.Duration -ProcessWorkingDirectory $tempRoot
             }
@@ -1292,29 +1314,36 @@ function Convert-SingleFile {
             '-fps_mode', 'passthrough',
             '-vf', $encodeZscale
         )
-        if ($VideoBitrate -gt 0) {
+        if ($Encoder -eq 'NVENC') {
+            $encodeArgs += @(Get-NvencArguments -NvencPreset $NvencPreset -Bitrate $VideoBitrate `
+                -MaxBitrate $MaxVideoBitrate -Quality $NvencCq -FrameRate $info.Fps -Lossless:$Lossless)
+        }
+        elseif ($VideoBitrate -gt 0) {
             $encodeArgs += @('-b:v', ('{0}k' -f $VideoBitrate), '-maxrate', ('{0}k' -f $MaxVideoBitrate),
                 '-bufsize', ('{0}k' -f (2 * $MaxVideoBitrate)))
         }
         elseif (-not $Lossless) { $encodeArgs += @('-crf', [string]$Crf) }
+        if ($Encoder -eq 'x265') { $encodeArgs += @('-c:v', 'libx265', '-preset', $Preset, '-x265-params', $x265Params) }
         $encodeArgs += @(
-            '-c:v', 'libx265',
-            '-preset', $Preset,
             '-color_primaries', 'bt2020',
             '-color_trc', $script:OutputTransfer,
             '-colorspace', 'bt2020nc',
             '-color_range', 'tv',
-            '-x265-params', $x265Params,
             '-f', 'hevc',
             $blHevc
         )
 
         $modeLabel = 'CRF ' + $Crf
+        $presetLabel = $Preset
+        if ($Encoder -eq 'NVENC') { $modeLabel = 'CQ ' + $NvencCq; $presetLabel = $NvencPreset }
         if ($VideoBitrate -gt 0) { $modeLabel = 'ABR {0}k / VBV {1}k' -f $VideoBitrate, $MaxVideoBitrate }
         if ($Lossless) { $modeLabel = '无损' }
-        Write-Log ('编码 SDR → {0} / DV {1}（白点 {2}nit，preset={3}，{4}）…' -f $script:OutputTransfer, $Profile, $WhitePoint, $Preset, $modeLabel)
+        Write-Log ('编码 SDR → {0} / DV {1}（{2}，preset={3}，{4}）…' -f $script:OutputTransfer, $Profile, $Encoder, $presetLabel, $modeLabel)
         $encodeWatch = [System.Diagnostics.Stopwatch]::StartNew()
-        if ($VideoBitrate -gt 0) {
+        if ($Encoder -eq 'NVENC' -and -not $Lossless) {
+            Write-Log 'NVENC HQ：全分辨率逐帧多遍分析、lookahead 和 AQ；单次遍历视频。'
+        }
+        if ($VideoBitrate -gt 0 -and $Encoder -eq 'x265') {
             $paramIndex = [Array]::IndexOf($encodeArgs, '-x265-params') + 1
             $firstPassArgs = @($encodeArgs)
             $firstPassArgs[$paramIndex] = $x265Params + ':pass=1:slow-firstpass=0:stats=x265_2pass.log'
@@ -1326,7 +1355,7 @@ function Convert-SingleFile {
             Write-Log '第 2 遍按分析结果编码…'
         }
         Invoke-MediaWithProgress -Exe $script:Ffmpeg -Arguments $encodeArgs -WorkDir $workDir `
-            -LogBaseName 'encode' -What 'x265 编码' -Label '编码' -TotalSeconds $info.Duration
+            -LogBaseName 'encode' -What ($Encoder + ' 编码') -Label '编码' -TotalSeconds $info.Duration
         $encodeWatch.Stop()
         Write-Log ('  编码完成，用时 {0}，输出 {1}' -f (Format-Elapsed $encodeWatch.Elapsed), (Format-Size (Get-Item -LiteralPath $blHevc).Length)) 'OK'
 
@@ -1540,6 +1569,16 @@ try {
 
     $script:WorkRoot = Get-AsciiWorkRoot
     Write-Log ('  临时目录 : {0}' -f $script:WorkRoot) 'DIM'
+    if ($Encoder -eq 'NVENC' -and $Profile -ne '8.4') { throw 'NVENC 当前仅支持 Profile 8.4 / HLG；8.1 / HDR10 基础层请使用 -Encoder x265。' }
+    if ($Encoder -eq 'NVENC' -and $PSBoundParameters.ContainsKey('Crf')) { throw 'NVENC 质量模式请用 -NvencCq；需要 CRF 时使用 -Encoder x265。' }
+    if ($Encoder -eq 'Auto' -and ($Profile -ne '8.4' -or $PSBoundParameters.ContainsKey('Crf'))) { $Encoder = 'x265' }
+    if ($Encoder -ne 'x265') {
+        $nvencProbe = Test-NvencSupport -Ffmpeg $script:Ffmpeg -IncludeLossless:($HdrMode -eq 'TrueHDR' -or $Lossless)
+        if ($nvencProbe.Ready) { $Encoder = 'NVENC' }
+        elseif ($Encoder -eq 'NVENC') { throw ('NVENC 10bit HEVC 初始化失败：' + $nvencProbe.Error) }
+        else { Write-Log ('NVENC 不可用，Auto 使用 x265：' + $nvencProbe.Error) 'WARN'; $Encoder = 'x265' }
+    }
+    Write-Log ('  视频编码 : {0}' -f $Encoder) 'DIM'
 
     $inputItem = Get-Item -LiteralPath $InputPath
     $videoExtensions = @('.mkv', '.mp4', '.m4v', '.mov', '.ts', '.m2ts', '.mts', '.avi', '.wmv', '.flv', '.webm', '.vob', '.mxf', '.h265', '.hevc')

@@ -74,7 +74,9 @@ def map_display_rgb(xp, rgb, table, strength=1.0):
     position = xp.clip(code*(len(table)-1),0,len(table)-1)
     low = position.astype(xp.int32)
     high = xp.minimum(low+1,len(table)-1)
-    fraction = position-low
+    # An int32 subtraction promotes float32 to float64 in NumPy/CuPy.
+    # Keep the incoming precision for the remaining full-resolution GPU grade.
+    fraction = position-low.astype(position.dtype)
     mapped = table[low]*(1-fraction)+table[high]*fraction
     target = y+(mapped-y)*strength
     scale = xp.where(y > 1e-12,target/xp.maximum(y,1e-12),1)

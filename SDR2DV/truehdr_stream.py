@@ -1,9 +1,9 @@
 """Bounded SDR -> NVIDIA TrueHDR -> HLG -> lossless Main10 cache pipeline.
 
 Raw frames exist only in RAM/pipes. The cache stores the exact 10-bit 4:2:0
-pixels needed by final x265, not full-film PQ RGB or 16-bit RGB FFV1 files.
-Final two-pass ABR reuses this cache without repeating AI or adding an
-intermediate quantizer. Optional HDR10 is encoded concurrently, never via PQ
+pixels needed by the final encoder, not full-film PQ RGB or 16-bit RGB FFV1.
+NVENC or x265 reuses this lossless cache without repeating AI or adding an
+intermediate quantizer. Optional HDR10 retains x265 mastering SEI, never via PQ
 FFV1. Audio is handled separately by the existing muxing stage.
 """
 import argparse
@@ -49,16 +49,29 @@ def encoder_command(args, width, height, fps, output, pq=False):
         mastering_peak = 1000 if mapping_info(args.tone_mapping,args.tone_strength,args.skin_strength)['name'] == 'reference' else args.luminance
         params += (':master-display=G(8500,39850)B(6550,2300)R(35400,14600)'
                    f'WP(15635,16450)L({mastering_peak * 10000},1)')
+    encoding = cache_encoding_args(getattr(args,'cache_encoder','x265'),transfer)
+    if pq:
+        # Keep the optional PQ comparison's existing mastering-display SEI.
+        encoding = ['-c:v','libx265','-preset','ultrafast','-x265-params',params]
     command = [args.ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-n',
                '-f', 'rawvideo', '-pixel_format', 'x2bgr10le' if pq else 'gbrp16le',
                '-video_size', f'{width}x{height}', '-framerate', str(fps), '-i', 'pipe:0',
-               '-an', '-vf', PQ_TO_YUV if pq else HLG_TO_YUV, '-fps_mode', 'passthrough',
-               '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params', params,
+               '-an', '-vf', PQ_TO_YUV if pq else HLG_TO_YUV, '-fps_mode', 'passthrough'] + encoding + [
                '-color_primaries', 'bt2020', '-color_trc', transfer, '-colorspace', 'bt2020nc',
                '-color_range', 'tv', '-flush_packets', '1']
     if pq:
         command += ['-tag:v', 'hvc1']
     return command + [str(output)]
+
+
+def cache_encoding_args(encoder,transfer='arib-std-b67'):
+    if encoder == 'nvenc':
+        return ['-c:v','hevc_nvenc','-gpu','0','-profile:v','main10','-pix_fmt','p010le',
+                '-preset','p6','-tune','lossless','-rc','constqp','-qp','0','-bf','0']
+    if encoder != 'x265':
+        raise ValueError('Cache encoder must be nvenc or x265')
+    return ['-c:v','libx265','-preset','ultrafast','-x265-params',
+            f'lossless=1:repeat-headers=1:colorprim=bt2020:transfer={transfer}:colormatrix=bt2020nc:log-level=error']
 
 
 def convert(args):
@@ -79,6 +92,7 @@ def convert(args):
                   reference_peak_nits=1000, hlg_system_gamma=1.2,
                   intermediate_pixel_format='yuv420p10le', intermediate_lossless=True,
                   raw_video_files_created=False)
+    report['cache_encoder'] = getattr(args,'cache_encoder','x265')
     report_path.write_text(json.dumps(report, indent=2), encoding='utf-8')
     decoder = hlg_encoder = pq_encoder = None
     handles = []
@@ -221,6 +235,7 @@ if __name__ == '__main__':
     parser.add_argument('--tone-mapping',choices=['reference','neutral'],default='reference')
     parser.add_argument('--tone-strength',type=float,default=1.)
     parser.add_argument('--skin-strength',type=float,default=.5)
+    parser.add_argument('--cache-encoder',choices=['nvenc','x265'],default='nvenc')
     parser.add_argument('-progress', dest='progress')
     parser.add_argument('-nostats', action='store_true')
     args = parser.parse_args()

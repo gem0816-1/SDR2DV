@@ -4,7 +4,7 @@ param([string]$Python = '', [switch]$CheckOnly)
 $ErrorActionPreference = 'Stop'
 $venvPython = Join-Path $PSScriptRoot '.venv-truehdr\Scripts\python.exe'
 try {
-    foreach ($module in @('brightness_mapping.py', 'hdr_math.py', 'pq_to_hlg.py', 'truehdr_backend.py', 'truehdr_stream.py')) {
+    foreach ($module in @('encoding.ps1', 'brightness_mapping.py', 'hdr_math.py', 'pq_to_hlg.py', 'truehdr_backend.py', 'truehdr_stream.py')) {
         if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $module) -PathType Leaf)) {
             throw "Incomplete TrueHDR package: missing $module. Extract the complete release ZIP again."
         }

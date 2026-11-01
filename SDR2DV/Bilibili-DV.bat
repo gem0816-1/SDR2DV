@@ -15,6 +15,7 @@ exit /b %result%
 :usage
 echo Drag an SDR video file onto this batch file.
 echo Output: Profile 8.4 / HLG, highlight peak 1000 nits, target 28 Mbps.
+echo Encoder Auto: NVENC P6 HQ when available, otherwise x265.
 echo PCM audio: lossless ALAC. Sample rate and bit depth are preserved.
 pause
 exit /b 1

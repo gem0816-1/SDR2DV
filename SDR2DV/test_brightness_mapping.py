@@ -42,6 +42,18 @@ class BrightnessMappingTests(unittest.TestCase):
         self.assertTrue(np.all(luminance(display)<=1000.001))
         self.assertGreater(luminance(display)[1],luminance(rgb)[1])
 
+    def test_float32_grade_retains_precision_and_reference_values(self):
+        rgb = np.random.default_rng(3).uniform(0,500,(3,1000)).astype(np.float32)
+        mapped = map_display_rgb(np,rgb,luminance_lut())
+        self.assertEqual(mapped.dtype,np.dtype('float32'))
+        reference = map_display_rgb(np,rgb.astype(np.float64),luminance_lut())
+        actual = correct_warm_skin(np,mapped,.5)
+        expected = correct_warm_skin(np,reference,.5)
+        code,_ = display_to_hlg(actual.T)
+        expected_code,_ = display_to_hlg(expected.T)
+        # Less than one hundredth of a 10bit signal step against float64 math.
+        np.testing.assert_allclose(code,expected_code,atol=.01/1023,rtol=0)
+
     def test_warm_correction_reduces_yellow_and_preserves_luminance(self):
         rgb = np.array([[80.,40.],[64.,30.],[25.,18.]])
         corrected = correct_warm_skin(np,rgb,.5)

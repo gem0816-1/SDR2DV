@@ -30,9 +30,12 @@ SDK 的 Windows 条件见 [官方说明](https://docs.nvidia.com/maxine/vfx/late
 | `-BrightnessStrength` | `1` | 参考曲线强度 0..1，0 等同 Neutral |
 | `-SkinToneCorrection` | `0.5` | Reference 暖色去黄强度 0..1；0 关闭 |
 | `-Bilibili` | 关 | 固定 8.4、HLG、目标 28000 kbps、VBV 30000 kbps |
+| `-Encoder` | `Auto` | 8.4 且 NVENC 实测可用时启用；`NVENC` 强制硬件编码，`x265` 强制软件编码 |
+| `-NvencPreset` | `p6` | NVENC `p1`..`p7`；P6 HQ 为默认 |
+| `-NvencCq` | `18` | NVENC 无目标码率时的质量参数，不等同 CRF |
 | `-Preset` | `slow` | x265 预设；`medium` 为质量与速度折中 |
 | `-Crf` | `17` | 质量模式，越低通常越大；与目标码率模式互斥 |
-| `-VideoBitrate` | `0` | kbps，正数启用两遍 ABR；不能与 `-Crf` / `-Lossless` 同用 |
+| `-VideoBitrate` | `0` | kbps，正数启用目标码率；x265 为整片两遍，NVENC 为内部逐帧多遍分析 |
 | `-MaxVideoBitrate` | 自动 | 目标码率模式的 VBV 上限；B站预设上限 30000 kbps |
 | `-WhitePoint` | `203` | 普通模式 SDR 白点，可选 `100` / `203` nit |
 | `-PeakNits` | `0` | 普通模式可选 `0` / `1000`；B站默认 `1000` |
@@ -42,7 +45,7 @@ SDK 的 Windows 条件见 [官方说明](https://docs.nvidia.com/maxine/vfx/late
 | `-OutputDir` | 源目录 | 成片目录 |
 | `-KeepTemp` | 关 | 保留本次缓存、中间文件及日志 |
 | `-Force` | 关 | 覆盖已有成片 |
-| `-Lossless` | 关 | x265 无损编码，体积很大；不表示整个 SDR→DV 流程无损 |
+| `-Lossless` | 关 | 所选编码器的无损模式，体积很大；不表示整个 SDR→DV 流程无损 |
 
 完整帮助：`Get-Help .\SDR2DV\SDR2DV.ps1 -Full`。
 文件夹模式只处理当前层的视频文件，跳过识别出的 `_DV81` / `_DV84` / `_TrueHDR_HDR10` / `_TrueHDR_Ref_HDR10` 成片。
@@ -54,7 +57,8 @@ SDK 的 Windows 条件见 [官方说明](https://docs.nvidia.com/maxine/vfx/late
 TrueHDR 固定输出 8.4，不接受叠加的 `-WhitePoint` / `-PeakNits` 高光曲线。
 `-TrueHDRPython` 可指定其他独立 Python 环境；`-KeepHDR10` 另存独立 HDR10/PQ MP4。
 
-SDK 使用逐帧内存管道，缓存为最终编码所需 10bit 4:2:0 像素的无损 HEVC，两遍编码复用缓存，不重复执行 AI。
+SDK 使用逐帧内存管道，缓存为最终编码所需 10bit 4:2:0 像素的无损 HEVC，最终编码复用缓存，不重复执行 AI。
+选择 NVENC 时 HLG 缓存也使用 NVENC Main10 lossless；x265 模式保留原无损缓存编码。可选 HDR10/PQ 对照继续使用 x265，以保留现有 mastering-display SEI。
 这减少了 RGB 中间文件的占用，但缓存仍可能大于源视频，不能按固定压缩比预估所有素材。
 运行中会估算剩余空间；临时盘低于 1 GB 时终止。复杂画面变化和其他程序写入仍可能导致空间不足。
 
@@ -67,6 +71,18 @@ SDK 使用逐帧内存管道，缓存为最终编码所需 10bit 4:2:0 像素的
 
 工具核验源文件 SHA256、缓存 SHA256 和全部 SDK 参数，不一致会拒绝；外部传入缓存不会被本次清理删除。
 旧 PQ FFV1 缓存也可读取；未保存 HDR10 的缓存不能补出 HDR10 对照文件。
+
+### NVENC 硬件编码
+
+`Auto` 在 Profile 8.4 且真实 NVENC 初始化通过时选择 NVIDIA 编码，失败会说明原因并使用 x265；明确指定 `-Encoder NVENC` 时失败直接报错。8.1 自动使用 x265，强制 NVENC + 8.1 会被拒绝。
+NVENC 固定 Main10 / 4:2:0、CUDA 设备 0，默认 P6 / HQ；目标码率模式采用 VBR、fullres 逐帧多遍分析、20 帧 lookahead、空间/时间 AQ 和参考 B 帧。B站目标与 VBV 上限继续为 28/30 Mbps。
+这种逐帧分析只需一次遍历视频，不等同 x265 的全片两遍码率统计；同码率不保证两种编码器画质相同。无目标码率时使用 `-NvencCq`，显式 `-Crf` 会让 Auto 选择 x265，强制 NVENC 则报错。
+NVENC 初始化检查会实际测试 Main10，TrueHDR 或无损模式还会测试 lossless 初始化。硬件、驱动和 FFmpeg 必须共同支持；原音处理、RPU 生成、帧数校验和本次临时文件清理沿用现有流程。
+调色插值保留 float32 输入精度，避免提升为 float64；曲线、1000 nit 参考模型及肤色去黄参数不变。
+
+参考：[NVIDIA FFmpeg 指南](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/ffmpeg-with-nvidia-gpu/index.html)、[逐帧多遍编码](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/nvenc-video-encoder-api-prog-guide/index.html#multi-pass-frame-encoding)。
+
+GPU 回归可在兼容硬件上运行：`$env:SDR2DV_TEST_NVENC='1'; .\SDR2DV\.venv-truehdr\Scripts\python.exe -m unittest discover -s SDR2DV -p 'test_*.py'`。其中 NVENC 测试使用包含全部低位的真实 10bit 样本，检查无损编码解码逐字节一致；未设置该变量时跳过硬件测试。
 
 ### 参考亮度曲线
 
