@@ -1,152 +1,81 @@
-# 参数与转换说明
+# 参数与运行
 
-下列命令从仓库根目录运行。快速安装及基本转换见 [README](../README.md)。
+快速开始见 [README](../README.md)。转换唯一入口仍为 `SDR2DV/SDR2DV.ps1`；TUI 不实现推理、编码或封装。
 
-## 工具与依赖
+## TUI
 
-优先读取一键部署生成的 `.tools/tools.json`；未部署时从 `PATH` 查找。`dovi_tool`、`mp4muxer` 仍可用 `-DoviTool`、`-Mp4Muxer` 显式覆盖。
-MP4 必须使用 Dolby mp4muxer 先写入 DOVI 配置；TrueHDR 的 MKV 路径也需要它恢复正确视频时间戳。
-普通 MKV 可不依赖 mp4muxer，但封装后仍会检查时长。
-
-一键部署可自动准备项目内的 Python 3.11；独立安装脚本仍可用已有 Python 创建 `SDR2DV/.venv-truehdr`：
-
-```powershell
-.\SDR2DV\Setup-TrueHDR.ps1 -Python "D:\Python311\python.exe"
-.\SDR2DV\Setup-TrueHDR.ps1 -CheckOnly
-```
-
-依赖为 `nvidia-vfx==0.2.0.0`（NVIDIA 包索引）、`numpy==2.4.6` 和 `cupy-cuda12x[ctk]==14.2.0`。
-SDK 的 Windows 条件见 [官方说明](https://docs.nvidia.com/maxine/vfx/latest/WindowsVFXSDK/GetStartedonWindows.html)，其中列有外接显示器条件；单台机器推理通过不能证明其他配置兼容。
-
-## 常用参数
-
-| 参数 | 默认 | 作用 |
-| --- | --- | --- |
-| `-InputPath` | 必填 | 视频文件或文件夹 |
-| `-Format` | `mp4` | `mp4` / `mkv` / `both` |
-| `-Profile` | `8.1` | `8.1` 为 PQ，`8.4` 为 HLG |
-| `-HdrMode` | `Original` | `Original` / `TrueHDR` |
-| `-BrightnessMapping` | `Reference` | TrueHDR 亮度风格：`Reference` / `Neutral` |
-| `-BrightnessStrength` | `1` | 参考曲线强度 0..1，0 等同 Neutral |
-| `-SkinToneCorrection` | `0.5` | Reference 暖色去黄强度 0..1；0 关闭 |
-| `-Bilibili` | 关 | 固定 8.4、HLG、目标 28000 kbps、VBV 30000 kbps |
-| `-Encoder` | `Auto` | 8.4 且 NVENC 实测可用时启用；`NVENC` 强制硬件编码，`x265` 强制软件编码 |
-| `-NvencPreset` | `p6` | NVENC `p1`..`p7`；P6 HQ 为默认 |
-| `-NvencCq` | `18` | NVENC 无目标码率时的质量参数，不等同 CRF |
-| `-Preset` | `slow` | x265 预设；`medium` 为质量与速度折中 |
-| `-Crf` | `17` | 质量模式，越低通常越大；与目标码率模式互斥 |
-| `-VideoBitrate` | `0` | kbps，正数启用目标码率；x265 为整片两遍，NVENC 为内部逐帧多遍分析 |
-| `-MaxVideoBitrate` | 自动 | 目标码率模式的 VBV 上限；B站预设上限 30000 kbps |
-| `-WhitePoint` | `203` | 普通模式 SDR 白点，可选 `100` / `203` nit |
-| `-PeakNits` | `0` | 普通模式可选 `0` / `1000`；B站默认 `1000` |
-| `-StatsFps` | `4` | 每秒亮度采样帧数 |
-| `-Mp4AudioCodec` | `auto` | `auto` / `copy` / `alac` / `eac3` / `ac3` |
-| `-AudioBitrate` | `640` | 仅显式 `eac3` / `ac3` 使用，单位 kbps |
-| `-OutputDir` | 源目录 | 成片目录 |
-| `-KeepTemp` | 关 | 保留本次缓存、中间文件及日志 |
-| `-Force` | 关 | 覆盖已有成片 |
-| `-Lossless` | 关 | 所选编码器的无损模式，体积很大；不表示整个 SDR→DV 流程无损 |
-
-完整帮助：`Get-Help .\SDR2DV\SDR2DV.ps1 -Full`。
-文件夹模式只处理当前层的视频文件，跳过识别出的 `_DV81` / `_DV84` / `_TrueHDR_HDR10` / `_TrueHDR_Ref_HDR10` 成片。
-
-## TrueHDR 参数与缓存
-
-默认传给 SDK：`-TrueHDRLuminance 1000 -TrueHDRContrast 100 -TrueHDRSaturation 100 -TrueHDRMiddleGray 50`。
-默认启用 AI Debanding，`-TrueHDRDebandingOff` 可关闭。SDK 失败会报错，不替换成其他算法。
-TrueHDR 固定输出 8.4，不接受叠加的 `-WhitePoint` / `-PeakNits` 高光曲线。
-`-TrueHDRPython` 可指定其他独立 Python 环境；`-KeepHDR10` 另存独立 HDR10/PQ MP4。
-
-SDK 使用逐帧内存管道，缓存为最终编码所需 10bit 4:2:0 像素的无损 HEVC，最终编码复用缓存，不重复执行 AI。
-选择 NVENC 时 HLG 缓存也使用 NVENC Main10 lossless；x265 模式保留原无损缓存编码。可选 HDR10/PQ 对照继续使用 x265，以保留现有 mastering-display SEI。
-这减少了 RGB 中间文件的占用，但缓存仍可能大于源视频，不能按固定压缩比预估所有素材。
-运行中会估算剩余空间；临时盘低于 1 GB 时终止。复杂画面变化和其他程序写入仍可能导致空间不足。
-
-要保留重试能力，首次执行时主动加 `-KeepTemp`；默认失败清理后无法复用本次缓存。
-已有完成缓存可这样续跑：
+双击或拖拽单个视频到 `SDR2DV/TrueHDR-DV.bat`。菜单支持中文、方向键、Enter，摘要确认后启动独立转换进程。
+`L` 展开日志，`Ctrl+C` 写入本次取消标记，等待核心清理；超时只终止本次进程树。强制退出仍可能残留本次缓存。
+不扫描/清理其他任务目录，不删除输入。界面日志与报告留在 `.tools/tui-runs/<随机ID>/`，依赖保存在项目 venv。
+当前 TUI 接收单个视频；文件夹批量继续使用 PowerShell CLI。没有终端时不会自动开始转换。
 
 ```powershell
-.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -Preset medium -TrueHDRCache "D:\saved-work"
+.\SDR2DV\Start-Tui.ps1 "D:\中文 视频.mov"
+# 无转换的参数/硬件/媒体预检
+.\SDR2DV\.venv-tui\Scripts\python.exe -X utf8 .\SDR2DV\tui.py "D:\movie.mov" --dry-run
+# 非交互保留原 CLI
+.\SDR2DV\Start-Tui.ps1 -NonInteractive -InputPath "D:\movie.mov" -Encoder NVENC
 ```
 
-工具核验源文件 SHA256、缓存 SHA256 和全部 SDK 参数，不一致会拒绝；外部传入缓存不会被本次清理删除。
-旧 PQ FFV1 缓存也可读取；未保存 HDR10 的缓存不能补出 HDR10 对照文件。
+共享默认值由 `SDR2DV/defaults.json` 提供。TUI 固定 DV8.4/HLG/1000 nit，硬件菜单根据真实 Main10/lossless 初始化和 SDK 推理检查禁用不可用项；不会静默用普通映射冒充 TrueHDR。
 
-### NVENC 硬件编码
+## PowerShell 参数
 
-`Auto` 在 Profile 8.4 且真实 NVENC 初始化通过时选择 NVIDIA 编码，失败会说明原因并使用 x265；明确指定 `-Encoder NVENC` 时失败直接报错。8.1 自动使用 x265，强制 NVENC + 8.1 会被拒绝。
-NVENC 固定 Main10 / 4:2:0、CUDA 设备 0，默认 P6 / HQ；目标码率模式采用 VBR、fullres 逐帧多遍分析、20 帧 lookahead、空间/时间 AQ 和参考 B 帧。B站目标与 VBV 上限继续为 28/30 Mbps。
-这种逐帧分析只需一次遍历视频，不等同 x265 的全片两遍码率统计；同码率不保证两种编码器画质相同。无目标码率时使用 `-NvencCq`，显式 `-Crf` 会让 Auto 选择 x265，强制 NVENC 则报错。
-NVENC 初始化检查会实际测试 Main10，TrueHDR 或无损模式还会测试 lossless 初始化。硬件、驱动和 FFmpeg 必须共同支持；原音处理、RPU 生成、帧数校验和本次临时文件清理沿用现有流程。
-调色插值保留 float32 输入精度，避免提升为 float64；曲线、1000 nit 参考模型及肤色去黄参数不变。
+`Get-Help .\SDR2DV\SDR2DV.ps1 -Full` 保留全部旧参数。新默认和重要参数：
 
-参考：[NVIDIA FFmpeg 指南](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/ffmpeg-with-nvidia-gpu/index.html)、[逐帧多遍编码](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/nvenc-video-encoder-api-prog-guide/index.html#multi-pass-frame-encoding)。
+| 参数 | 默认 / 说明 |
+| --- | --- |
+| `-HdrMode` / `-Profile` | CLI 为 Original / 8.1；TUI 为 TrueHDR / 8.4 |
+| `-Bilibili` | 固定8.4、HLG、1000 nit；不强制28/30 Mbps |
+| `-Encoder` | Auto，8.4 优先实测可用 NVENC，否则 x265 |
+| `-NvencPreset` / `-Preset` | p6 / medium |
+| `-BitrateMode` | Source；可选 Platform / Custom / Quality |
+| `-VideoBitrate` | kbps；单独显式正数选择 Custom，显式0选择 Quality |
+| `-MaxVideoBitrate` | Source/Custom 默认目标的1.5倍 VBV；显式值不得低于目标 |
+| `-Crf` / `-NvencCq` | 显式指定选择 Quality；分别用于 x265 / NVENC |
+| `-Lossless` | 编码器视频无损模式，需 Quality，不代表 SDR→HDR 全流程无损 |
+| `-BrightnessMapping` | Neutral；Natural 实验；Reference 旧创作预设 |
+| `-BrightnessStrength` | 1，0..1，0旁路曲线 |
+| `-SkinToneCorrection` | Neutral/Natural 为0；显式 Reference 未指定时沿用0.5 |
+| `-KeepHDR10` | TrueHDR 额外输出同次推理的 PQ 对照，x265无损缓存，保留1000nit MDCV |
+| `-Mp4AudioCodec` | auto；copy / alac；普通模式保留显式 ac3/eac3 有损选项 |
+| `-Format` | mp4 / mkv / both；MKV 始终原音复制 |
+| `-OutputDir` / `-Force` | 源目录 / 不覆盖 |
+| `-StatsFps` | 旧参数兼容；最终分析不再跳帧，始终逐帧全分辨率 |
+| `-SceneCutsFile` | 可选JSON切点帧号，如 `[0,120,285]`；必须从0开始、有序、不越界 |
+| `-ActiveArea` | L,R,T,B 像素偏移，默认0,0,0,0；仅影响分析区域及L5，不缩放/裁剪视频 |
+| `-ReportPath` / `-EventPath` | 可选JSON验收报告 / JSONL进度事件 |
+| `-KeepTemp` | 显式保留本次中间媒体，默认成功/失败/合作式取消清理 |
 
-GPU 回归可在兼容硬件上运行：`$env:SDR2DV_TEST_NVENC='1'; .\SDR2DV\.venv-truehdr\Scripts\python.exe -m unittest discover -s SDR2DV -p 'test_*.py'`。其中 NVENC 测试使用包含全部低位的真实 10bit 样本，检查无损编码解码逐字节一致；未设置该变量时跳过硬件测试。
+## 码率与编码
 
-### 参考亮度曲线
+只读取第一视频流 `bit_rate` 和对应流时长；缺失/无效时累计该视频流包大小，以 PTS（退回 DTS）覆盖范围计算平均值。绝不把容器总码率当视频码率。
+Source 保留8/15/25/50 Mbps等源目标；高于B站公开历史建议30 Mbps时提示，仍保留目标。Platform 才显式限制目标≤28 Mbps、VBV≤30 Mbps。
+NVENC 为 VBR + HQ / fullres 逐帧多遍、lookahead20、空间/时间AQ；不是整片两遍。x265 ABR 使用整片两遍；高码率 NVENC 使用 High tier。
+编码后按最终视频包重新测量实际码率，展示源/目标/实际/偏差；偏差>10%会提示。不会插入无意义填充以冒充画质或重跑 AI 强凑码率。
+短片、低复杂度或超出编码器可用预算时偏差可能很大。低比特/像素风险提示是启发式检查，不是画质保证。
+保留源尺寸、SAR、CFR和完整帧数，最终封装再次核对；VFR/不连续时间线当前拒绝隐式改帧。8.1与独立HDR10保留x265，NVENC只用于8.4。
 
-TrueHDR 默认使用 `Reference`：SDK 输出先转换成绝对显示线性 RGB，再按亮度应用全片固定的单调曲线，最后转换到 HLG。
-PowerShell、TrueHDR 拖拽入口以及流式/旧 PQ 适配器使用相同默认值：参考曲线强度 1、肤色去黄强度 0.5。
-它是基于参考片亮度特征的创作预设，不是 HDR 标记修改，也不是逐帧自动曝光。黑色仍为零，亮度曲线通过 RGB 同比例缩放保持色度，中高亮展开，高光在 1000 nit 附近柔和收拢。
-随后按色相、饱和度和亮度软选取暖色肤色范围，轻微减绿、补蓝，并归一化保持显示线性亮度。默认强度 0.5，`-SkinToneCorrection 0` 关闭；灰阶与高饱和原色不参与修正。这是颜色范围选择，不识别人脸，相似颜色的物体也可能受影响。
-新转换在 GPU 上、首次 4:2:0 量化之前应用，HDR10 对照也使用同一亮度曲线；参考模式的 HDR10 mastering peak 为 1000 nit。
-`TrueHDRLuminance` 仍控制 SDK 本身，参考曲线的输出参考峰值固定为 1000 nit。曲线强度用于显示线性亮度混合，0 完全旁路。
+## 亮度与精度
 
-曲线依据 20 帧分散采样的 1000 nit HLG 参考模型及非近黑区域分位数拟合。参考片超出标称 RGB 信号范围的像素不直接复制为更高峰值，高光保留软肩。
-由于参考与测试 SDR 不是同画面素材，预设对齐的是亮度风格和亮区层次；不同场景的平均亮度不会相同，也不证明实机 Dolby 渲染逐镜头一致。
+TrueHDR SDK 输出RGB10A2/PQ；使用ST2084绝对EOTF，float32线性BT.2020调色，再以BT.2100 HLG逆OOTF/OETF转换至GBR16，最后一次4:2:0/10bit量化。
+HLG参考显示1000 nit、理想黑、gamma1.2；75% HLG信号约203 nit。超出HLG色体积的RGB等比缩限；不做自动全片曝光/饱和度提升。
+Natural 在0..600 nit保持亮度恒等（含暗部/中间调/漫反射白），600..1000采用C1连续单调多项式，以上指数软肩渐近1000；默认不修肤色。
+这是中性起点上的高光分配，不是对所有镜头强拉到1000 nit。Reference 是历史创作预设，可能压暗阴影/抬高中间调，仅保留对照。
+AI结果是推断，不是SDR剪切区域真实细节的证明。Natural通过数值/管线检查后仍需HDR显示观感和舞台灯光实测，故默认Neutral。
+4:2:0色度重建和有损编码可能产生高于目标的像素；最终MaxCLL如实报告，不用1000的目标值覆盖实测值。
+缓存为最终Main10像素的无损HEVC，不重复AI。可选HDR10在同一GPU调色结果上生成，避免额外RGB10量化。旧中性HLG缓存应用曲线需一次RGB/YUV往返，并非新路径像素等价。
+`-TrueHDRCache` 仍核对源/缓存SHA256和SDK/曲线参数；外部缓存不会被本次清理删除。旧已调色缓存不能反向恢复Neutral。
+宽色域SDR（如BT.2020/P3）不送入只接受Rec.709的SDK去隐式裁色，可用Original。TrueHDR要求8bit且明确SDR色彩标记、CFR/零视频起始PTS/偶数尺寸/方形像素/无旋转，拒绝自动降位深、缩放或重定时。
 
-```powershell
-.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -BrightnessStrength 0.7
-.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -BrightnessMapping Neutral
-```
+## 音频与元数据
 
-参考模式使用 `_TrueHDR_Ref_DV84` / `_TrueHDR_Ref_HDR10` 文件名；Neutral 保留原命名，已有成片不会被默认覆盖。
-新缓存记录曲线 ID、哈希、亮度及肤色修正强度，复用时防止重复叠加。已映射缓存只能按原参数复用，不能反向恢复中性画面。
-旧中性 HLG 缓存可在最终编码时用 129³ LUT 应用曲线，避免重跑 AI；这一路径增加一次 RGB/4:2:0 往返及 CPU 滤镜处理，和新转换的 GPU 路径不是逐像素等价。
-旧 PQ FFV1 缓存转换时直接应用 GPU 曲线。两种缓存路径都会重新测量最终基础层，并保留原有 RPU 统计限制。
-
-## 音频与 Hi-Res
-
-`auto` 仅在 B站 MP4 中将整数 PCM 转为 ALAC。16bit 保持 16bit，24bit 保持 24bit，不重采样、不调整音量、不混音。
-已有 ALAC、FLAC、AAC 等音轨直接复制；普通模式及 MKV 原音复制。
-显式 `alac` 仅接受受支持的 16/24bit 整数 PCM、ALAC、FLAC 和声道布局；不静默截断浮点或 32bit 源。
-TrueHDR 仅允许 `auto` / `copy` / `alac`。`eac3` / `ac3` 属于显式有损音频选项，仅用于普通画面转换模式。
-
-PCM 直接复制进 MP4 会使用 `ipcm`，其位深曾出现读取器识别差异（[FFmpeg 问题记录](https://ffmpeg.org/pipermail/ffmpeg-trac/2024-February/068631.html)）。
-ALAC 策略用于避开该封装路径，不能保证解决所有平台 Hi-Res 故障；平台转码仍需实测。
-16bit 源不会被伪装成 24bit Hi-Res，音频无损也不表示平台输出一定保留同样规格。
-
-已有 DV MP4 且源音频确为 48kHz/24bit 整数 PCM 时，可只复制视频、无损重新封装音频：
-
-```powershell
-ffmpeg -i "D:\movie_DV84.mp4" -i "D:\movie.mov" -map 0:v:0 -map '1:a?' -c copy -c:a alac -sample_fmt:a s32p -bits_per_raw_sample:a 24 -tag:v hvc1 -strict unofficial -movflags +faststart "D:\movie_DV84_ALAC.mp4"
-```
-
-输出后核对音频参数、解码采样值及 `DOVI configuration record`，再替换投稿。此命令不执行 TrueHDR 或视频重编码。
-
-## 画面映射与元数据限制
-
-普通模式将 SDR 白点映射到 203 nit。`-PeakNits 1000` 在线性 BT.2020 MaxRGB 大于 0.9 的区域逐渐扩展高光，等比缩放 RGB 保持色相；`-PeakNits 0` 关闭扩展。
-曲线预留 5% 编码余量，有损重建仍可能超调。它无法区分白色物体与镜面反射，也不能恢复 SDR 已丢失的高光细节。
-
-TrueHDR 输出 BT.2020/PQ RGB10A2，经 PQ EOTF、HLG 逆 OOTF 与 OETF 转为 HLG。
-HLG 参考模型为理想黑、1000 nit 参考白、系统 gamma 1.2；超出色体积时等比缩放 RGB，保留色度但降低这些像素的亮度。
-参考：[NVIDIA TrueHDR](https://docs.nvidia.com/maxine/vfx/latest/Filters/TrueHDR.html)、[Python API](https://docs.nvidia.com/maxine/vfx-python/latest/api.html)、[BT.2100](https://www.itu.int/rec/R-REC-BT.2100)。
-
-RPU 使用全片单段静态采样估计：L1 不是逐镜头分析，CM v4.0 的平均值下限为 1229，L6 MaxFALL 使用全片平均值近似。
-TrueHDR 的 L9 参考原色为 BT.2020；8.4 reshaping 采用 dovi_tool 静态模板，不等同专业动态调色。
-P8.4 会从编码后的 HLG 基础层回读亮度；默认每秒 4 帧的采样不能证明未采样帧没有瞬时高光。
-
-## 检查
-
-MP4 检查 DOVI 配置记录；MKV 提取流内 RPU 并核对帧数，检查时长偏差小于 0.1 秒。
-本地元数据通过不等于电视、手机或 B站必定启用 Dolby Vision，需另外播放确认。
-TrueHDR 对色彩标记、CFR、PTS、尺寸、像素比例和旋转均有检查；普通模式遇 VFR 仅警告，长片需自行核对同步。
-
-```powershell
-.\SDR2DV\.venv-truehdr\Scripts\python.exe -B -m unittest discover -s SDR2DV -p "test_*.py"
-.\SDR2DV\.venv-truehdr\Scripts\python.exe -B .\SDR2DV\analyze_hdr.py "D:\movie_TrueHDR_DV84.mp4" --output-prefix "D:\movie_metrics"
-```
-
-分析器测量解码像素在参考显示模型下的亮度，不以峰值元数据代替像素；结果不等于实机屏幕实测 nit。
+MP4 auto优先复制AAC/ALAC/FLAC/MP3/AC3/EAC3/Opus等兼容音轨；受支持16/24bit整数PCM转ALAC。其他格式拒绝自动有损降级；32bit/浮点/不支持布局可用MKV保留。
+不重采样、不改声道、不标准化；所有输出音轨逐条解码到同一源规格PCM，核对SHA256、采样数和相对视频的起始偏移；压缩流复制另比数据包哈希。
+MP4 `pcmC` 的位深/字节序、ALAC配置的位深/采样率/声道与解码结果交叉检查。legacy sample_size=16、pcmC=24不能单凭此认定文件损坏；下游可能存在解释风险。
+16bit保持16bit；工具的≥24bit/≥48kHz无损规格候选仅为保守预检，非平台官方验收承诺。详见 [音频A/B](audio-ab.md)。
+最终基础层每帧全像素以参考显示模型分析。CTA MaxCLL=max(MaxRGB)，MaxFALL=max(每帧mean(MaxRGB))，在线性nit域；CIE Y和PQ均值另记，互不冒充。
+GPU原生YUV10重建经FFmpeg双线性参考数值核验；CPU使用zscale。切镜为保守RGB-PQ缩略图检测，抑制单帧闪光，可提供人工切点。
+L1使用社区MaxRGB/PQ分析，不等同Dolby专有LMS/CM兼容算法；记录镜头PQ最小/最大/平均及dovi_tool CMv4兼容约束后的编码值，逐帧导出再核对L1与scene_refresh_flag。L6全片MaxCLL/FALL，L9 BT.2020，人工ActiveArea写L5。
+不会生成L2/L8创作性Trim；社区分析与dovi_tool 8.4模板不等同Dolby认证制作系统。HDR10对照含MDCV，不凭空填写未分析的MaxCLL/FALL SEI。
+本地DOVI/RPU、像素、音频通过不能证明B站或某台设备最终DV渲染正确；见 [验证边界](validation.md)。

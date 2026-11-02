@@ -1,63 +1,54 @@
 # SDR2DV
 
-Windows 下将 SDR 视频转换为 Dolby Vision Profile 8.1（PQ）或 8.4（HLG），输出 MP4 / MKV。
-支持普通映射、NVIDIA TrueHDR 和 B站投稿预设，保留源分辨率和帧数。
+Windows 下将 SDR 转为 Dolby Vision 8.4 / HLG 或 8.1 / PQ，输出 MP4 / MKV。
+支持 NVIDIA TrueHDR、NVENC / x265、源视频流码率匹配及音频完整性检查。
 
 ## 安装
 
-需要 Windows 10/11 x64、64 位 PowerShell 5.1 或 7，以及首次部署时的网络连接。
-下载 [最新 Release](https://github.com/gem0816-1/SDR2DV/releases/latest) 的 Windows ZIP，解压后双击 `deploy.bat`。
-部署会复用可用工具，缺少时下载并校验 FFmpeg、dovi_tool、mp4muxer；检测到 NVIDIA 显卡时自动准备 TrueHDR。
-依赖保存在项目目录，不修改系统 PATH，也不启动转换。重复部署复用缓存；仅需普通模式时运行 `deploy.bat -Mode Standard`。
-
-也可从源码部署：
+需要 Windows 10/11 x64、64 位 PowerShell 5.1 或 7，首次部署需要网络。
+克隆当前源码后运行部署；[旧 Release](https://github.com/gem0816-1/SDR2DV/releases/latest) 不一定包含本次尚未发布的 TUI。
 
 ```powershell
-git clone https://github.com/gem0816-1/SDR2DV.git
-cd SDR2DV
 .\deploy.bat
 ```
 
+部署复用可用工具，缺少时下载并校验 FFmpeg、dovi_tool、mp4muxer 和项目内 Python 环境。
+不修改系统 PATH，不向系统 Python 安装包。TrueHDR 另需兼容 NVIDIA GPU / 驱动，部署会实际检查推理。
+仅准备普通转换：`deploy.bat -Mode Standard`。详见 [部署说明](docs/deployment.md)。
+
 ## 使用
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-# 普通转换：输出同目录下的 movie_DV81.mp4
-.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -Preset medium
+双击 `SDR2DV\TrueHDR-DV.bat`，或将 SDR 视频拖到它上面。
+方向键选择编码器、亮度映射、容器、码率和音频策略，检查摘要后确认开始。
+转换中按 `L` 展开日志，`Ctrl+C` 请求安全取消本次任务。
 
-# B站预设：Profile 8.4 / HLG，视频目标 28 Mbps、上限 30 Mbps
-.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -Bilibili -Preset medium
+默认：DV 8.4、BT.2020 / HLG、Main10、1000 nit 参考峰值、Neutral、源码率匹配、Auto 优先 NVENC P6。
+Natural 提供保护中低亮度的平滑高光曲线，仍待 HDR 设备观感验收，暂不默认启用。
+MP4 默认复制兼容音轨；受支持的整数 PCM 无损转 ALAC，并核对解码样本；MKV 原音复制。
 
-# 同时生成 MP4 和 MKV
-.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -Format both -Preset medium
-```
-
-也可将视频拖到 `SDR2DV\一键转DV.bat` 或 `SDR2DV\Bilibili-DV.bat`。输入文件夹可批量处理；已有成片默认跳过。
-
-## NVIDIA TrueHDR（可选）
-
-另需兼容 NVIDIA GPU/驱动；先核对 [SDK 的硬件及外接显示器条件](https://docs.nvidia.com/maxine/vfx/latest/WindowsVFXSDK/GetStartedonWindows.html)。
-部署自动准备 Python 3.11、独立虚拟环境并执行真实推理检查；普通模式不需要 Python 或 NVIDIA GPU。
+保留 PowerShell 非交互运行：
 
 ```powershell
-.\Deploy.ps1 -Mode TrueHDR
-.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -Encoder NVENC
+# TrueHDR + 源视频流码率匹配
+.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili
+# Natural 试用，并保留 HDR10/PQ 对照
+.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -BrightnessMapping Natural -KeepHDR10
+# 普通映射，MP4 + MKV；无需 NVIDIA
+.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -Format both -Encoder x265
 ```
 
-也可拖到 `SDR2DV\TrueHDR-DV.bat`。默认使用参考亮度曲线，目标 1000 nit，输出 `movie_TrueHDR_Ref_DV84.mp4`。
-`-BrightnessStrength 0.7` 可减弱曲线；`-BrightnessMapping Neutral` 使用旧的 SDK 直接映射。
-参考模式默认以 `0.5` 强度轻微修正暖色肤色的偏黄；`-SkinToneCorrection 0` 关闭该修正。
+`-BitrateMode Platform` 显式使用平台兼容码率；`-BitrateMode Quality -NvencCq 18` 使用质量模式。
+`-OutputDir` 指定目录，`-Force` 覆盖，`-KeepTemp` 保留本次缓存；默认清理本次中间媒体。
+参数、TUI 和排错见 [使用说明](docs/usage.md)，审计与测试边界见 [验证说明](docs/validation.md)。
 
-## 配置与限制
+## 限制
 
-- `-OutputDir` 指定输出目录，`-Force` 覆盖已有成片；`-Mp4Muxer "D:\tools\mp4muxer.exe"` 指定封装工具。
-- `-Encoder Auto` 默认在 8.4 且硬件检查通过时使用 NVENC P6 HQ；强制 `NVENC` 失败会报错，`x265` 保留软件编码。`-NvencPreset` / `-NvencCq` 控制 NVENC 预设与质量；`-Preset` / `-Crf` 用于 x265。
-- B站 MP4 默认将 16/24bit 整数 PCM 无损编码为 ALAC，保留采样值、采样率、位深和声道；其他音轨、普通模式及 MKV 直接复制。`-Mp4AudioCodec copy` 可强制原编码复制。
-- 默认成功或失败均清理本次缓存、日志和中间文件，保留源视频与已校验成片；`-KeepTemp` 主动保留排错文件。强制结束或断电无法保证清理。
-- TrueHDR 缓存可能很大，需预留临时空间；输入须有明确 SDR 色彩标记、连续固定帧率、零起始 PTS、偶数尺寸、方形像素且无旋转。
-- 已是 HDR 的输入会被拒绝；MP4 不保留字幕，MKV 保留。ALAC 路径不自动降低 32bit/浮点 PCM 的规格或混音，不支持时会报错。
-- SDR 转 HDR 需要视频重编码；RPU 为采样估计的静态元数据，不等同专业逐镜头 Dolby 调色。目标 1000 nit 不代表屏幕实测亮度。
-- NVENC 当前支持 8.4 / HLG；8.1、可选 HDR10 对照保留 x265。NVENC 的逐帧多遍分析与 x265 整片两遍编码不同，画质和码率分配可能不同。
-- B站的 Dolby Vision / Hi-Res 识别与实际播放需上传后验证，不能仅凭本地元数据保证。
-
-部署选项和离线缓存见 [部署说明](docs/deployment.md)；完整参数与原理见 [使用说明](docs/usage.md)。
+- SDR 转 HDR 必须重编码；同码率不是数学无损。AI 高光推断无法恢复源中已剪切的真实细节。
+- 1000 nit 是参考目标；色度重建和有损编码可能超调，报告使用最终像素测量值。
+- Source 模式不静默限制高码率，但短片、简单画面或编码器限制可能无法用完预算；输出显示实际偏差。
+- TrueHDR 要求明确 SDR 标记、8bit 输入、连续 CFR、零视频起始 PTS、偶数尺寸、方形像素、无旋转；不支持时拒绝隐式改帧/降位深。
+- 无损 Main10 缓存及 HDR10 对照可能很大；磁盘空间保护不保证其他程序不会占满磁盘。
+- RPU 为全帧社区镜头分析，非官方认证调色；CMv4 L1 有兼容范围限制。MP4 不保留字幕，MKV 保留。
+- 音频不自动降规格；不支持的 PCM / ALAC 布局需选择 MKV 或显式复制并验证，16bit 不冒充 Hi-Res。
+- B站 Dolby Vision / Hi-Res 的最终识别、转码和播放仍需 [A/B 投稿实测](docs/audio-ab.md)，本地校验不能保证。
+- 正常结束和合作式取消仅清理本次媒体目录；强制结束/断电可能残留缓存。TUI 的小型日志与报告保存在 `.tools/tui-runs/`。

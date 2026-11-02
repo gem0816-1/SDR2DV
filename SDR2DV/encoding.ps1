@@ -21,6 +21,7 @@ function Get-NvencArguments {
         if ($MaxBitrate -lt $Bitrate) { throw 'NVENC maximum bitrate must be at least the target bitrate.' }
         $options += @('-b:v', ('{0}k' -f $Bitrate), '-maxrate', ('{0}k' -f $MaxBitrate),
             '-bufsize', ('{0}k' -f (2 * $MaxBitrate)))
+        if ($Bitrate -gt 30000 -or $MaxBitrate -gt 60000) { $options+=@('-tier','high') }
     }
     else { $options += @('-cq', [string]$Quality, '-b:v', '0') }
     return $options

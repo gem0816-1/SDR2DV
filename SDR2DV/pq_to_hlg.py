@@ -13,7 +13,7 @@ import time
 import numpy as np
 from hdr_math import display_to_hlg
 from truehdr_backend import CREATE_FLAGS, read_frame
-from brightness_mapping import luminance_lut, map_display_rgb, mapping_info, correct_warm_skin
+from brightness_mapping import luminance_lut, map_display_rgb, mapping_info, correct_warm_skin, apply_mapping
 
 
 def rgb_nits_to_hlg(cp, d):
@@ -92,6 +92,8 @@ def convert(args):
             p=subprocess.Popen(dec,stdout=subprocess.PIPE,stderr=de,creationflags=CREATE_FLAGS)
             q=subprocess.Popen(enc,stdin=subprocess.PIPE,stderr=ee,creationflags=CREATE_FLAGS)
             while True:
+                from task_io import check_cancel
+                check_cancel()
                 raw=read_frame(p.stdout,w*h*6)
                 if not raw: break
                 # FFmpeg's gbrp10le -> x2bgr10le swscale path changes RGB codes
@@ -99,7 +101,9 @@ def convert(args):
                 # format conversion; reorder only G,B,R -> R,G,B on CUDA.
                 planar=cp.asarray(np.frombuffer(raw,'<u2').reshape(3,h,w))
                 rgb=planar[[2,0,1]].astype(cp.float32)/1023
-                planes,limited=rgb_pq_to_hlg(cp,rgb,tone_lut,tone['strength'],tone['skin_strength'])
+                nits=apply_mapping(cp,rgb_pq_to_nits(cp,rgb),tone,tone_lut)
+                code,limited=rgb_nits_to_hlg(cp,nits)
+                planes=cp.rint(cp.clip(code[[1,2,0]],0,1)*65535).astype(cp.uint16)
                 limited_count+=int(limited.sum().get())
                 q.stdin.write(cp.asnumpy(planes).astype('<u2',copy=False).tobytes())
                 count+=1
@@ -132,9 +136,9 @@ if __name__=='__main__':
     parser.add_argument('--frames',required=True,type=int)
     parser.add_argument('--ffmpeg',default='ffmpeg')
     parser.add_argument('--ffprobe',default='ffprobe')
-    parser.add_argument('--tone-mapping',choices=['reference','neutral'],default='reference')
+    parser.add_argument('--tone-mapping',choices=['reference','neutral','natural'],default='neutral')
     parser.add_argument('--tone-strength',type=float,default=1.)
-    parser.add_argument('--skin-strength',type=float,default=.5)
+    parser.add_argument('--skin-strength',type=float)
     parser.add_argument('--cache-encoder',choices=['nvenc','x265'],default='nvenc')
     parser.add_argument('-progress',dest='progress')
     parser.add_argument('-nostats',action='store_true')

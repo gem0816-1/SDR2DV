@@ -1,0 +1,64 @@
+# 审计与验证（2026-11-02）
+
+基线：v1.10.0 / `c41284535b4f4abf598d05146cafad65f5d90ae1`，开始时当前工作树无未提交改动。本页记录本次开发与本地验收结果，不代表已发布 Release 或通过平台验收。
+日志、媒体和机器报告在本机 `validation/audit/`（Git忽略）；下列结果不能代替HDR设备或B站最终播放验收。
+
+## 实施结果
+
+| 阶段 | 本地已验证 | 仍有限制 / 待验收 |
+| --- | --- | --- |
+| 亮度 | 1000 nit目标不变；Natural 0..600nit恒等、C1软肩、默认不变色；PQ/HLG标准数值、GPU转换及HDR10对照 | Natural仍为实验，不默认启用；HDR肤色/灯光观感待实机，SDR剪切信息不可真实恢复 |
+| 码率 | Source默认，取视频流字段、缺失/无效时按视频包字节/时间估算；NVENC VBR、x265整片两遍；最终包重新测量 | 不保证任何素材实际值精确等于目标；短片/低复杂度/过大预算可明显不足，均显示偏差，不填充掩盖 |
+| 音频 | copy优先；PCM→ALAC bit exact；16bit保持16bit；多轨、字节序、位深、布局、采样数和偏移检查；ISO PCM/ALAC描述审计 | B站Hi-Res最终处理音轨尚未取得；不能确认电流声根因或宣称平台问题已彻底解决 |
+| RPU | 最终基础层全帧全像素MaxRGB统计、镜头检测/手工切点、逐镜头L1、L6、L9及可选L5；封装后再提取核对L1/镜头/帧数 | 社区PQ/MaxRGB分析，不是Dolby专有LMS/CM兼容算法；L1兼容范围限制单独记录，未虚构L2/L8或L3补偿 |
+| TUI | Rich+Questionary、中文/方向键、真实能力菜单、共享默认值、音频/TrueHDR输入预检、摘要确认、实时阶段/速度、日志展开、独立取消 | 当前交互入口处理单文件；文件夹批量保留CLI；强制结束/断电不能保证清理 |
+
+## 实际测试
+
+环境：Windows x64，PowerShell5.1/7，FFmpeg7.1-full、dovi_tool2.3.4，RTX4060 Laptop / NVIDIA596.49，Python3.11.9、SDK1.3.0、CuPy14.2。
+
+- 本机TUI环境（启用真实NVENC与取消测试）运行49项测试：47通过，2项CuPy测试跳过；SDK/CUDA环境单独补测这2项通过。包含真实FFmpeg音频、dovi_tool生成/导出、NVENC10bit无损往返、独立进程取消，而不全是CPU模拟测试。
+- CPU数值：黑位/阴影/203nit白点、Natural单调与C1连续性、PQ/HLG往返、MaxFALL线性MaxRGB口径、暗场切镜/闪光抑制、码率包时间跨度等通过。
+- CUDA：与FFmpeg双线性BT.2020参考核对left/center/topleft采样位置，以及饱和色、full/limited范围、PQ/HLG结果通过。
+- 音频：48kHz/24bit PCM→ALAC逐样本一致；16bit、big-endian PCM、多AAC轨复制/包哈希、ipcm/pcmC描述通过；主动改信号、截短音频、偏移时间、改坏pcmC会拒绝。
+- 实际转换：720p/30、4K/60影片切片、600帧10秒样本；DV8.4 MP4/MKV和HDR10/PQ对照、8.1/PQ x265、8.4 x265、NVENC及缓存复用均执行。无演唱会追光/LED/烟雾验收。
+- 双镜头合成片：60帧/2镜头，最终MP4/MKV提取的scene_refresh_flag和每帧L1与配置一致；源/输出尺寸、SAR、帧率、帧数与视频时长检查通过。
+- 视频无损选项实际转换后，将最终MP4与Main10缓存解码到yuv420p10le，SHA256一致；HDR10首帧MDCV实读1000nit。
+- 真正Windows终端运行了菜单方向键、NVENC选择、确认、L展开和实际转换；菜单取消及核心合作式取消均检查。核心退出130、仅删除自身GUID媒体目录，其他任务哨兵/输入未改；强制取消测试保留无关进程。
+- PowerShell5.1/7无参均输出用法（退出1，非语法错误）；5.1 UTF-8 JSON/中文路径实际解析通过。Python AST、PS解析、BOM/换行与BAT ASCII检查通过。
+- 部署缓存/拒绝坏哈希/ZIP穿越等5项通过；现有TUI环境复用、pip check、Standard CheckOnly通过。未做本次版本的全新联网便携安装/新GPU机器部署。
+- `Desktop/1/dubi`的dovi_tool、其exebak、mp4muxer、mp4demuxer SHA256均与保护快照一致。
+
+本地主要报告：`acceptance.json`、`multi-shot.json`、`source-match-5s.json`、`source-match-5s-hdr-diagnostics.json`、`final-natural.json`、`x265-pq.json`、`x265-hlg.json`、`tests-final.log`、`hdr-gpu-tests.log`、`core-cancel-test.log`。
+
+## 实际码率与峰值边界
+
+| 真实测试 | 源 / 目标 Mbps | 输出视频流 Mbps | 偏差 |
+| --- | --- | --- | --- |
+| 4K/60五秒Source（默认Neutral） | 12.356 / 12.356 | 12.320 | -0.29% |
+| 4K/60两秒Source（Natural） | 13.198 / 13.198 | 11.240 | -14.84% |
+| 4K/60十秒高码率Source（Natural） | 146.447 / 146.447 | 32.573 | -77.76% |
+| 4K/60一秒x265 Platform | 197.246 / 28.000 | 27.700 | -1.07% |
+
+最后一行仅为显式Platform；高码率Source从未静默降成28/30 Mbps。码率相同并不保证像素无损，预算不足也不能保证HDR画质。
+
+映射前/中的1000nit上限不能保证有损编码和4:2:0重建后所有像素硬≤1000nit。实际五秒低码率样本测得MaxRGB1596.96、最大CIEY1466.93nit；最严重一帧MaxRGB>1000的占比约0.00887%，CIEY>1100占比约0.00109%。
+这证明有少量重建超调，不能把目标值当实测值，也不能据单个样本保证其他视频无大面积剪切。报告保留真实MaxCLL/FALL、CIEY和超参考像素占比，未将1000改成650来隐藏问题。
+旧float32 RGB分析同一4K/60一秒缓存耗时33.72秒；原生YUV/CUDA版本约3.59秒（后加超调计数会有开销）。新方法指定双线性重建并单独核对CPU参考，未宣称旧滤波设置与新方法逐像素相同。
+
+## 外部验收
+
+1. 在同一HDR/DV设备和播放器核对Neutral、Natural、HDR10/PQ与DV渲染，记录肤色、暗部、LED高饱和光和闪切；目前没有这项新映射的实机结论。
+2. 使用本机 `validation/audit/audio-ab/A_ALAC_DV84.mp4`、`B_PCM_ipcm_DV84.mp4`；两者本地音频与源解码一致、都有DV8.4配置。依据 [A/B流程](audio-ab.md) 投稿，取得最终音轨后再定位服务器/播放端。
+3. 若要专业Dolby交付，仍需经授权的分析/Trim/Metafier与监看链路验证。工具未实现或宣称官方认证系统，也没有用元数据存在替代实机验收。
+
+## 标准与实现依据
+
+- [ITU-R BT.2100](https://www.itu.int/rec/R-REC-BT.2100)：PQ、HLG及参考显示模型。
+- [CTA亮度统计参考实现](https://psychtoolbox.org/docs/ComputeHDRStaticMetadataType1ContentLightLevels)：在线性显示RGB计算MaxCLL/FALL，与CIEY分开。
+- [ETSI TS103572](https://www.etsi.org/deliver/etsi_ts/103500_103599/103572/01.03.01_60/ts_103572v010301p.pdf)：MaxRGB/PQ元数据及偏移的规范语义；不把简单PQ差值冒充Dolby L3兼容算法。
+- [Dolby元数据层级](https://professionalsupport.dolby.com/s/article/Dolby-Vision-Metadata-Levels)、[Dolby制作实践](https://professionalsupport.dolby.com/s/article/Dolby-Vision-Content-Creation-Best-Practices-Guide?language=en_US)：L1/L3兼容边界及创作Trim的区别。
+- [dovi_tool2.3.4生成器](https://github.com/quietvoid/dovi_tool/blob/2.3.4/dolby_vision/src/rpu/generate.rs)：实际编码约束；原始测量和编码值分别记录。
+- [FFmpeg7.1 MOV/MP4封装实现](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavformat/movenc.c)：pcmC格式/位深和字节序，ALAC配置与解码交叉验证。
+- [NVENC逐帧多遍](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/nvenc-video-encoder-api-prog-guide/index.html#multi-pass-frame-encoding)：不称为整片两遍编码。
+- [B站早期DV投稿说明](https://www.bilibili.com/opus/560508706903943321)：30Mbps为公开历史建议，不能据此推定为当前硬限制；Hi-Res候选预检不是平台验收承诺。

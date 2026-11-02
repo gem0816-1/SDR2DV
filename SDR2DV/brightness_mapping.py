@@ -23,17 +23,22 @@ ANCHORS = np.array([
     [164.65, 950], [403.15, 990], [1000, 1000], [10000, 1000],
 ], dtype=np.float64)
 PROFILE_SHA256 = hashlib.sha256(PROFILE_ID.encode()+b':warm-skin-v1:'+ANCHORS.astype('<f8').tobytes()).hexdigest()
+NATURAL_ID = 'natural1000-v1'
+NATURAL_SHA256 = hashlib.sha256(b'natural1000-v1:identity<=600;hermite600-980;exp-tail400;no-auto-skin').hexdigest()
 
 
-def mapping_info(name='reference', strength=1.0, skin_strength=.5):
+def mapping_info(name='reference', strength=1.0, skin_strength=None):
     name = name.lower()
     strength = float(strength)
-    skin_strength = float(skin_strength)
-    if (name not in ('reference', 'neutral') or not np.isfinite(strength) or not 0 <= strength <= 1 or
+    skin_strength = float((.5 if name=='reference' else 0) if skin_strength is None else skin_strength)
+    if (name not in ('reference', 'neutral', 'natural') or not np.isfinite(strength) or not 0 <= strength <= 1 or
             not np.isfinite(skin_strength) or not 0 <= skin_strength <= 1):
         raise ValueError('Brightness mapping must be reference/neutral with strength 0..1')
     if name == 'neutral' or strength == 0:
         return dict(name='neutral', strength=0., skin_strength=0., profile_id=None, profile_sha256=None)
+    if name == 'natural':
+        return dict(name=name,strength=strength,skin_strength=skin_strength,
+                    profile_id=NATURAL_ID,profile_sha256=NATURAL_SHA256)
     return dict(name=name, strength=strength, skin_strength=skin_strength, profile_id=PROFILE_ID, profile_sha256=PROFILE_SHA256)
 
 
@@ -56,7 +61,25 @@ def _monotone_cubic(x, y, values):
     return np.where(values <= x[0],y[0],np.where(values >= x[-1],y[-1],result))
 
 
-def luminance_lut(size=4096):
+def natural_luminance(xp, nits):
+    """Creative shoulder, not a BT.2100 transfer function or AI reconstruction.
+
+    Identity through 600 nit (including black, shadows and 203-nit diffuse
+    white). A C1 Hermite shoulder reaches 980 nit at an input of 1000 nit;
+    an exponential tail approaches 1000 without forcing a shot to that peak.
+    No per-frame exposure, shadow crush, colour or saturation adjustment.
+    """
+    t = xp.clip((nits-600)/400,0,1)
+    shoulder = 600+400*t+320*t*t-340*t*t*t
+    tail = 980+20*(-xp.expm1(-xp.maximum(nits-1000,0)/400))
+    return xp.where(nits<=600,nits,xp.where(nits<=1000,shoulder,tail))
+
+
+def luminance_lut(size=4096, name='reference'):
+    if name == 'natural':
+        result = natural_luminance(np,pq_eotf(np.linspace(0,1,size)))
+        result[0] = 0
+        return result.astype(np.float32)
     x, y = pq_encode(ANCHORS[:,0]), pq_encode(ANCHORS[:,1])
     x[0] = y[0] = 0.
     result = pq_eotf(_monotone_cubic(x,y,np.linspace(0,1,size)))
@@ -81,6 +104,17 @@ def map_display_rgb(xp, rgb, table, strength=1.0):
     target = y+(mapped-y)*strength
     scale = xp.where(y > 1e-12,target/xp.maximum(y,1e-12),1)
     return rgb*scale[None,...]
+
+
+def apply_mapping(xp,rgb,tone,table=None):
+    if tone['name']=='natural':
+        y=xp.maximum(.2627*rgb[0]+.6780*rgb[1]+.0593*rgb[2],0)
+        target=y+(natural_luminance(xp,y)-y)*tone['strength']
+        scale=xp.where(y>1e-12,target/xp.maximum(y,1e-12),1)
+        mapped=rgb*scale[None,...]
+    else:
+        mapped=map_display_rgb(xp,rgb,table,tone['strength'])
+    return correct_warm_skin(xp,mapped,tone['skin_strength'])
 
 
 def correct_warm_skin(xp, rgb, strength=.5):
@@ -115,30 +149,30 @@ def correct_warm_skin(xp, rgb, strength=.5):
     return xp.stack((r*scale,green*scale,blue*scale))
 
 
-def map_encoded_rgb(rgb, transfer='hlg', strength=1.0, skin_strength=.5):
+def map_encoded_rgb(rgb, transfer='hlg', strength=1.0, skin_strength=None, mapping='reference'):
     """CPU reference, channel-last RGB; used for LUT export and verification."""
-    tone = mapping_info('reference',strength,skin_strength)
+    tone = mapping_info(mapping,strength,skin_strength)
     display = hlg_eotf(np.clip(rgb,0,1)) if transfer == 'hlg' else pq_eotf(np.clip(rgb,0,1))
-    mapped = map_display_rgb(np,np.moveaxis(display,-1,0),luminance_lut(),tone['strength'])
-    mapped = np.moveaxis(correct_warm_skin(np,mapped,tone['skin_strength']),0,-1)
+    table = luminance_lut(name=tone['name']) if tone['name']!='neutral' else None
+    mapped = np.moveaxis(apply_mapping(np,np.moveaxis(display,-1,0),tone,table),0,-1)
     if transfer == 'hlg':
         return display_to_hlg(mapped)[0]
     mapped = mapped/np.maximum(np.max(mapped,axis=-1)/1000,1)[...,None]
     return np.clip(pq_encode(mapped),0,1)
 
 
-def write_cube(path, transfer='hlg', strength=1., size=129, skin_strength=.5):
+def write_cube(path, transfer='hlg', strength=1., size=129, skin_strength=None, mapping='reference'):
     if size < 2 or size > 256:
         raise ValueError('Cube size must be 2..256')
-    mapping_info('reference',strength,skin_strength)
+    tone=mapping_info(mapping,strength,skin_strength)
     axis = np.linspace(0,1,size)
     red, green = np.meshgrid(axis,axis)
     with Path(path).open('x',encoding='ascii',newline='\n') as output:
-        output.write(f'TITLE "{PROFILE_ID}; {transfer}; strength={strength}; skin={skin_strength}"\nLUT_3D_SIZE {size}\n')
+        output.write(f'TITLE "{tone["profile_id"]}; {transfer}; strength={strength}; skin={tone["skin_strength"]}"\nLUT_3D_SIZE {size}\n')
         output.write('DOMAIN_MIN 0 0 0\nDOMAIN_MAX 1 1 1\n')
         for blue in axis:
             rgb = np.stack((red.ravel(),green.ravel(),np.full(size*size,blue)),axis=-1)
-            np.savetxt(output,map_encoded_rgb(rgb,transfer,strength,skin_strength),fmt='%.9f')
+            np.savetxt(output,map_encoded_rgb(rgb,transfer,strength,skin_strength,mapping),fmt='%.9f')
 
 
 if __name__ == '__main__':
@@ -148,12 +182,13 @@ if __name__ == '__main__':
     parser.add_argument('--transfer',choices=['hlg','pq'],default='hlg')
     parser.add_argument('--strength',type=float,default=1.)
     parser.add_argument('--size',type=int,default=129)
-    parser.add_argument('--skin-strength',type=float,default=.5)
+    parser.add_argument('--skin-strength',type=float)
+    parser.add_argument('--mode',choices=['natural','neutral','reference'],default='reference')
     args = parser.parse_args()
-    info = mapping_info('reference',args.strength,args.skin_strength)
+    info = mapping_info(args.mode,args.strength,args.skin_strength)
     if args.describe:
         print(json.dumps(info))
     if args.write_cube:
-        write_cube(args.write_cube,args.transfer,args.strength,args.size,args.skin_strength)
+        write_cube(args.write_cube,args.transfer,args.strength,args.size,args.skin_strength,args.mode)
     if not args.describe and not args.write_cube:
         parser.error('--describe or --write-cube is required')

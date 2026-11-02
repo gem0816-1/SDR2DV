@@ -7,7 +7,7 @@
     流水线：
       1) SDR 标准映射或可选高光扩展，保留中低亮度基准
       2) SDR → PQ 或 HLG（BT.2020）10bit，NVENC 硬件或 x265 软件编码
-      3) 按 PQ 域采样生成 RPU；CM v4.0 限制平均值下限，L6 MaxFALL 仍为近似
+      3) 从最终基础层逐帧统计 MaxRGB 亮度、检测镜头，生成社区分析 RPU
       4) 把 RPU 注入 HEVC
       5) 封装：MP4 用 Dolby mp4muxer（写入 DOVI 配置记录）；MKV 用 ffmpeg（音轨/字幕全保留）
       6) 校验输出
@@ -29,7 +29,7 @@
     8.1：PQ / HDR10 兼容基础层；8.4：HLG 兼容基础层。
 
 .PARAMETER Bilibili
-    B站投稿预设：Profile 8.4、HLG、目标 28000 kbps、VBV 30000 kbps，默认高光峰值 1000 nit。
+    B站投稿预设：Profile 8.4、HLG、1000 nit。默认匹配源视频流码率；Platform 模式才限制平台兼容码率。
 
 .PARAMETER PeakNits
     1000：扩展最亮一段，中低亮度保持 WhitePoint 基准；0：关闭高光扩展。
@@ -38,25 +38,28 @@
     Original 保留原转换；TrueHDR 使用官方 NVIDIA SDK，固定输出 P8.4，不叠加原高光曲线。
 
 .PARAMETER BrightnessMapping
-    TrueHDR 亮度曲线：Reference 默认匹配参考片的亮度风格；Neutral 保留旧的 SDK 直接映射。
+    Neutral 默认保留 SDK 直接映射；Natural 实验模式保护中低亮度并平滑收肩；Reference 保留旧参考曲线。
 
 .PARAMETER BrightnessStrength
-    Reference 曲线强度，0..1，默认 1；0 相当于 Neutral。
+    Natural / Reference 曲线强度，0..1，默认 1；0 相当于 Neutral。
 
 .PARAMETER SkinToneCorrection
-    Reference 模式暖色肤色去黄强度，0..1，默认 0.5；0 保持原色。使用柔和色相选择而非人脸检测。
+    暖色肤色去黄强度，0..1；Neutral/Natural 默认 0，显式 Reference 默认 0.5。
 
 .PARAMETER KeepHDR10
     TrueHDR 模式额外保留独立 HDR10/PQ MP4，音轨遵循 Mp4AudioCodec 策略。
 
 .PARAMETER VideoBitrate
-    视频目标码率（kbps），0 使用 CRF。正数使用 ABR；实际平均值依内容而变。
+    显式指定时切换为 Custom（kbps）；0 为 Quality。未指定时由 BitrateMode 决定。
+
+.PARAMETER BitrateMode
+    Source 默认匹配视频流平均码率；Platform 显式限制平台兼容码率；Custom 自定义；Quality 使用 CRF/CQ 或无损。
 
 .PARAMETER MaxVideoBitrate
     VBV 码率上限（kbps），与 -VideoBitrate 同用；不是逐包瞬时码率保证。
 
 .PARAMETER Preset
-    x265 预设，默认 slow（质量优先）。嫌慢可改 medium / fast。
+    x265 预设，默认 medium。
 
 .PARAMETER Encoder
     Auto 默认在 Profile 8.4 且 NVENC 实测可用时启用硬件编码；否则使用 x265。
@@ -75,14 +78,14 @@
     所选编码器的无损模式（体积巨大，仅测试/收藏用）。
 
 .PARAMETER Mp4AudioCodec
-    默认 auto：B站将 16/24bit 整数 PCM 无损改封为 ALAC，其余原样复制。
+    默认 auto：MP4 将可支持的整数 PCM 无损改封为 ALAC，兼容音轨原样复制，MKV 原样复制。
     copy 强制复制；alac 显式无损编码；eac3/ac3 仅显式指定时允许有损转码。
 
 .PARAMETER AudioBitrate
     显式选择 eac3/ac3 时使用的音频转码码率（kbps），默认 640；copy 模式不使用。
 
 .PARAMETER StatsFps
-    亮度采样帧率，默认 4（每秒取 4 帧）。越高峰值越准，分析越慢。
+    保留旧参数兼容；最终亮度统计固定为逐帧、全分辨率，不再跳帧采样。
 
 .PARAMETER OutputDir
     输出目录，默认与输入同目录。
@@ -135,14 +138,14 @@ param(
 
     [switch]$TrueHDRDebandingOff,
 
-    [ValidateSet('Reference', 'Neutral')]
-    [string]$BrightnessMapping = 'Reference',
+    [ValidateSet('Reference', 'Neutral', 'Natural')]
+    [string]$BrightnessMapping = 'Neutral',
 
     [ValidateRange(0.0, 1.0)]
     [double]$BrightnessStrength = 1.0,
 
     [ValidateRange(0.0, 1.0)]
-    [double]$SkinToneCorrection = 0.5,
+    [double]$SkinToneCorrection = 0.0,
 
     [switch]$KeepHDR10,
 
@@ -150,11 +153,30 @@ param(
 
     [string]$TrueHDRCache = '',
 
+    [ValidateSet('Source','Platform','Custom','Quality')]
+    [string]$BitrateMode = 'Source',
+
+    [string]$CorePython = '',
+
+    [string]$SceneCutsFile = '',
+
+    [string]$ActiveArea = '0,0,0,0',
+
+    [string]$EventPath = '',
+
+    [string]$CancelFile = '',
+
+    [string]$ReportPath = '',
+
+    [switch]$GetCapabilities,
+
+    [switch]$DescribeInput,
+
     # kbps；0 使用 CRF，正数使用 ABR + VBV。
-    [ValidateRange(0, 200000)]
+    [ValidateRange(0, 2147483647)]
     [int]$VideoBitrate = 0,
 
-    [ValidateRange(0, 200000)]
+    [ValidateRange(0, 2147483647)]
     [int]$MaxVideoBitrate = 0,
 
     [ValidateSet('100', '203')]
@@ -165,7 +187,7 @@ param(
     [int]$PeakNits = 0,
 
     [ValidateSet('ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow')]
-    [string]$Preset = 'slow',
+    [string]$Preset = 'medium',
 
     [ValidateSet('Auto', 'NVENC', 'x265')]
     [string]$Encoder = 'Auto',
@@ -203,8 +225,27 @@ param(
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '1.10.0'
+$script:ScriptVersion = '2.0.0-dev'
 . (Join-Path $PSScriptRoot 'encoding.ps1')
+. (Join-Path $PSScriptRoot 'core.ps1')
+$script:Defaults = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'defaults.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$defaultMap=@{BrightnessMapping='brightness_mapping';BrightnessStrength='brightness_strength';SkinToneCorrection='skin_tone_correction';
+    Encoder='encoder';NvencPreset='nvenc_preset';NvencCq='nvenc_cq';Preset='preset';Crf='crf';Format='format';BitrateMode='bitrate_mode';Mp4AudioCodec='audio_codec'}
+foreach ($parameter in $defaultMap.Keys) {
+    if (-not $PSBoundParameters.ContainsKey($parameter)) { Set-Variable -Name $parameter -Value $script:Defaults.($defaultMap[$parameter]) }
+}
+if ($BrightnessMapping -eq 'Reference' -and -not $PSBoundParameters.ContainsKey('SkinToneCorrection')) { $SkinToneCorrection=$script:Defaults.reference_skin_tone_correction }
+$script:MachineMode=($GetCapabilities -or $DescribeInput)
+$savedConsoleEncoding=$null
+if ($script:MachineMode -or $EventPath) {
+    $savedConsoleEncoding=[Console]::OutputEncoding
+    [Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)
+}
+$script:Results=@()
+$script:BoundOptions=@{}
+foreach ($name in $PSBoundParameters.Keys) { $script:BoundOptions[$name]=$PSBoundParameters[$name] }
+$savedCancelEnvironment=$env:SDR2DV_CANCEL_FILE
+if ($CancelFile) { $env:SDR2DV_CANCEL_FILE=[IO.Path]::GetFullPath($CancelFile) }
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -215,6 +256,8 @@ function Write-Log {
         [ValidateSet('STEP', 'INFO', 'OK', 'WARN', 'ERR', 'DIM')]
         [string]$Level = 'INFO'
     )
+    Write-TaskEvent -Type 'log' -Data @{message=$Message;level=$Level}
+    if ($script:MachineMode) { return }
     $prefix = '  -'
     $color = 'Gray'
     switch ($Level) {
@@ -301,8 +344,9 @@ function Build-ArgumentString {
     foreach ($a in $Arguments) {
         if ($null -eq $a) { continue }
         $s = [string]$a
-        if ($s -match '[\s"]') {
-            $s = '"' + ($s -replace '"', '\"') + '"'
+        if ($s -eq '' -or $s -match '[\s"]') {
+            $s = $s -replace '(\\*)"', '$1$1\"'
+            $s = '"' + ($s -replace '(\\+)$', '$1$1') + '"'
         }
         $parts += $s
     }
@@ -337,19 +381,25 @@ function Invoke-MediaWithProgress {
     if ($ProcessWorkingDirectory) { $psi.WorkingDirectory = $ProcessWorkingDirectory }
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
+    $psi.EnvironmentVariables['PYTHONUTF8']='1'
     $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $true
     $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     if (-not $proc.Start()) { throw "$What 启动失败" }
     $errTask = $proc.StandardError.ReadToEndAsync()
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    Write-TaskEvent -Type 'stage' -Data @{stage=$Label;process_id=$proc.Id}
     try {
     $startTime = Get-Date
     $lastUpdate = $startTime
     $printed = $false
 
     while (-not $proc.HasExited) {
+        Assert-TaskNotCancelled
         Start-Sleep -Milliseconds 500
         $now = Get-Date
         if (($now - $lastUpdate).TotalSeconds -lt 1) { continue }
@@ -379,7 +429,9 @@ function Invoke-MediaWithProgress {
         }
         if ($speed) { $status += ('  speed={0}' -f $speed) }
         $status += ('  已用 {0}' -f (Format-Elapsed ([TimeSpan]::FromSeconds((($now - $startTime).TotalSeconds)))))
-        Write-Host ("`r" + $status.PadRight(88)) -NoNewline
+        Write-TaskEvent -Type 'progress' -Data @{stage=$Label;frame=$frame;seconds=$outSeconds;total_seconds=$TotalSeconds;
+            elapsed_seconds=($now-$startTime).TotalSeconds;speed=$speed;fps=($frame/[math]::Max(.001,($now-$startTime).TotalSeconds))}
+        if (-not $script:MachineMode) { Write-Host ("`r" + $status.PadRight(88)) -NoNewline }
         $printed = $true
     }
 
@@ -390,14 +442,18 @@ function Invoke-MediaWithProgress {
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         try { [System.IO.File]::WriteAllText($errLog, $errText, $utf8NoBom) } catch { }
     }
-    if ($printed) {
+    $nativeExit = $proc.ExitCode
+    if ($printed -and -not $script:MachineMode) {
         $elapsed = (Get-Date) - $startTime
-        Write-Host ("`r" + ('   {0} 完成，用时 {1}' -f $Label, (Format-Elapsed $elapsed)).PadRight(88))
+        $state='完成'; if ($nativeExit -ne 0) { $state='失败' }
+        Write-Host ("`r" + ('   {0} {1}，用时 {2}' -f $Label,$state,(Format-Elapsed $elapsed)).PadRight(88))
     }
+    if ($outTask.Result) { [IO.File]::WriteAllText((Join-Path $WorkDir ($LogBaseName+'.stdout.log')),$outTask.Result,(New-Object Text.UTF8Encoding($false))) }
 
     $exitCode = -999
     try { $exitCode = $proc.ExitCode } catch { $exitCode = -999 }
     if ($exitCode -ne 0) {
+        Write-TaskEvent -Type 'error' -Data @{stage=$Label;message=$errText;exit_code=$exitCode}
         if ($errText) {
             $lines = @($errText -split "`r?`n" | Where-Object { $_ -ne '' })
             $tailCount = [math]::Min(20, $lines.Count)
@@ -422,18 +478,30 @@ function Invoke-MediaWithProgress {
 
 function Invoke-NativeQuiet {
     param([string]$Exe, [string[]]$Arguments, [string]$What)
-    $savedPreference = $ErrorActionPreference
+    Assert-TaskNotCancelled
+    $psi=New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName=$Exe;$psi.Arguments=Build-ArgumentString $Arguments
+    $psi.UseShellExecute=$false;$psi.CreateNoWindow=$true
+    $psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true
+    $psi.StandardOutputEncoding=[Text.Encoding]::UTF8;$psi.StandardErrorEncoding=[Text.Encoding]::UTF8
+    $psi.EnvironmentVariables['PYTHONUTF8']='1'
+    $child=New-Object Diagnostics.Process;$child.StartInfo=$psi
+    $started=$false
     try {
-        # Windows PowerShell treats redirected native stderr as ErrorRecords;
-        # capture the complete diagnostic before applying its actual exit code.
-        $ErrorActionPreference = 'Continue'
-        $output = & $Exe @Arguments 2>&1
-        $code = $LASTEXITCODE
+        if (-not $child.Start()) { throw ($What+' could not start') }
+        $started=$true
+        Write-TaskEvent -Type 'stage' -Data @{stage=$What;process_id=$child.Id}
+        $stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync()
+        while (-not $child.WaitForExit(250)) { Assert-TaskNotCancelled }
+        $output=$stdout.Result+"`n"+$stderr.Result
+        if ($child.ExitCode -ne 0) {
+            Write-TaskEvent -Type 'error' -Data @{message=$output;stage=$What}
+            throw ('{0} 失败（退出码 {1}）：{2}' -f $What,$child.ExitCode,$output)
+        }
     }
-    finally { $ErrorActionPreference = $savedPreference }
-    if ($code -ne 0) {
-        if ($output) { $output | Out-Host }
-        throw "$What 失败（退出码 $code）"
+    finally {
+        if ($started -and -not $child.HasExited) { & "$env:SystemRoot\System32\taskkill.exe" /PID $child.Id /T /F 2>$null | Out-Null; $child.WaitForExit() }
+        if ($child) { $child.Dispose() }
     }
 }
 
@@ -491,31 +559,6 @@ function Get-NumericValue {
 # ---------------------------------------------------------------------------
 # 亮度 / PQ 计算
 # ---------------------------------------------------------------------------
-function Convert-PqSignalToNits {
-    param([double]$Signal)
-    if ($Signal -le 0.0) { return 0.0 }
-    $m1 = 0.1593017578125
-    $m2 = 78.84375
-    $c1 = 0.8359375
-    $c2 = 18.8515625
-    $c3 = 18.6875
-    $p = [math]::Pow($Signal, 1.0 / $m2)
-    $num = $p - $c1
-    if ($num -lt 0.0) { $num = 0.0 }
-    $den = $c2 - $c3 * $p
-    if ($den -le 0.0) { return 10000.0 }
-    return 10000.0 * [math]::Pow($num / $den, 1.0 / $m1)
-}
-
-function Convert-YuvCodeToPqSignal {
-    param([double]$Code)
-    # 转换输出固定为 10bit limited，Y: 64..940
-    $signal = ($Code - 64.0) / 876.0
-    if ($signal -lt 0.0) { $signal = 0.0 }
-    if ($signal -gt 1.0) { $signal = 1.0 }
-    return $signal
-}
-
 # 在线性 BT.2020 RGB 域生成高光曲线。以 MaxRGB 等比缩放三通道，尽量保持色相。
 # 最亮 10%（线性 MaxRGB > 0.9）平滑扩展至目标峰值；其余保持原白点映射。
 function New-HighlightLut {
@@ -566,6 +609,7 @@ function New-ReferenceBrightnessFilter {
         $strength = $BrightnessStrength.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
         Invoke-NativeQuiet -Exe $script:TrueHDRPython -Arguments @('-B', $mappingScript,
             '--write-cube', $cubePath, '--transfer', $Transfer, '--strength', $strength,
+            '--mode', $BrightnessMapping.ToLowerInvariant(),
             '--skin-strength', $SkinToneCorrection.ToString('R', [Globalization.CultureInfo]::InvariantCulture)) -What '生成参考亮度 LUT'
     }
     $trc = 'arib-std-b67'
@@ -613,8 +657,7 @@ function Get-IncomingVideoInfo {
         $fps = ConvertTo-FractionValue $fpsText
     }
     if ($fps -le 0) {
-        $fps = 25.0
-        $fpsText = '25'
+        throw '无法确定源帧率；不会猜测为 25fps。'
     }
     $avgFps = ConvertTo-FractionValue ([string]$v.avg_frame_rate)
     if ($avgFps -le 0) { $avgFps = $fps }
@@ -641,87 +684,12 @@ function Get-IncomingVideoInfo {
         InRange = $rangeMode
         AudioStreams = $audioStreams
         SubtitleStreams = $subtitleStreams
+        SourceStream = $v
     }
 }
 
 # ---------------------------------------------------------------------------
 # 亮度分析（解码 + 转 PQ 后采样）
-# ---------------------------------------------------------------------------
-function Measure-ContentBrightness {
-    param(
-        [string]$SourcePath,
-        [string]$ZscaleChain,
-        [string]$WorkDir,
-        [int]$SampleFps,
-        [double]$TotalSeconds = 0
-    )
-
-    $logName = 'stats.log'
-    $logPath = Join-Path $WorkDir $logName
-    if (Test-Path -LiteralPath $logPath) { Remove-Item -LiteralPath $logPath -Force }
-
-    $filter = 'fps={1},{0},signalstats,metadata=print:file={2}' -f $ZscaleChain, $SampleFps, $logName
-    $statsArgs = @('-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', $SourcePath,
-        '-map', '0:v:0', '-an', '-sn', '-dn', '-vf', $filter, '-f', 'null', '-')
-
-    Invoke-MediaWithProgress -Exe $script:Ffmpeg -Arguments $statsArgs -WorkDir $WorkDir `
-        -LogBaseName 'brightness' -What '亮度分析' -Label '分析' -TotalSeconds $TotalSeconds
-
-    if (-not (Test-Path -LiteralPath $logPath)) { throw '亮度分析没有产生统计数据' }
-
-    $maxCode = 0.0
-    $minCode = 2000.0
-    $sumAvg = 0.0
-    $samples = 0
-
-    foreach ($line in [System.IO.File]::ReadLines($logPath)) {
-        if ($line.Length -lt 24) { continue }
-        if ($line.StartsWith('lavfi.signalstats.YMAX=')) {
-            $value = ConvertTo-FractionValue ($line.Substring(23))
-            if ($value -gt $maxCode) { $maxCode = $value }
-        }
-        elseif ($line.StartsWith('lavfi.signalstats.YMIN=')) {
-            $value = ConvertTo-FractionValue ($line.Substring(23))
-            if ($value -lt $minCode) { $minCode = $value }
-        }
-        elseif ($line.StartsWith('lavfi.signalstats.YAVG=')) {
-            $sumAvg += (ConvertTo-FractionValue ($line.Substring(23)))
-            $samples++
-        }
-    }
-
-    if ($samples -lt 1) { throw '亮度分析样本为空（视频可能太短）' }
-
-    $avgCode = $sumAvg / $samples
-    if ($minCode -gt $maxCode) { $minCode = 0.0 }
-
-    $maxSignal = Convert-YuvCodeToPqSignal -Code $maxCode
-    $avgSignal = Convert-YuvCodeToPqSignal -Code $avgCode
-    $minSignal = Convert-YuvCodeToPqSignal -Code $minCode
-
-    $maxPq = [int][math]::Round($maxSignal * 4095.0)
-    $avgPq = [int][math]::Round($avgSignal * 4095.0)
-    $minPq = [int][math]::Round($minSignal * 4095.0)
-
-    if ($avgPq -lt $minPq) { $avgPq = $minPq }
-    if ($maxPq -lt $avgPq) { $maxPq = $avgPq }
-    if ($maxPq -lt 1) { $maxPq = 1 }
-
-    $maxNits = Convert-PqSignalToNits -Signal ($maxPq / 4095.0)
-    $avgNits = Convert-PqSignalToNits -Signal ($avgPq / 4095.0)
-
-    return @{
-        Samples = $samples
-        MaxPq = $maxPq
-        AvgPq = $avgPq
-        MinPq = $minPq
-        MaxNits = $maxNits
-        AvgNits = $avgNits
-    }
-}
-
-# ---------------------------------------------------------------------------
-# 帧数统计（以编码后的 HEVC 为准）
 # ---------------------------------------------------------------------------
 function Get-HevcFrameCount {
     param([string]$Path)
@@ -737,15 +705,6 @@ function Get-HevcFrameCount {
         $text = (($raw -join '') -replace '[^0-9]', '')
         [int]::TryParse($text, [ref]$count) | Out-Null
     }
-    if ($count -le 0) {
-        $info = Get-MediaInfo -Path $Path
-        $duration = 0.0
-        if ($info.format -and $info.format.duration) { $duration = Get-NumericValue $info.format.duration }
-        $v = @($info.streams | Where-Object { $_.codec_type -eq 'video' })[0]
-        $fps = ConvertTo-FractionValue ([string]$v.r_frame_rate)
-        if ($fps -le 0) { $fps = 25.0 }
-        $count = [int][math]::Round($duration * $fps)
-    }
     if ($count -le 0) { throw '无法确定帧数' }
     return $count
 }
@@ -754,69 +713,18 @@ function Get-HevcFrameCount {
 # 生成 DV 8.1 RPU
 # ---------------------------------------------------------------------------
 function New-DvRpu {
-    param(
-        [string]$DoviExe,
-        [int]$FrameCount,
-        [hashtable]$Stats,
-        [string]$WorkDir
-    )
-
-    $maxCll = [int][math]::Max(1, [math]::Round($Stats.MaxNits))
-    $maxFall = [int][math]::Max(1, [math]::Round($Stats.AvgNits))
-    if ($maxFall -gt $maxCll) { $maxFall = $maxCll }
-
-    $configPath = Join-Path $WorkDir 'generator.json'
-    $rpuPath = Join-Path $WorkDir 'RPU.bin'
-    $defaultBlocks = ''
-    if ($HdrMode -eq 'TrueHDR') {
-        # dovi_tool 2.3.4 Level9: index 2 = BT.2020, matching our reference
-        # working/mastering colour space; its implicit default is P3 D65.
-        $defaultBlocks = '"default_metadata_blocks": [{"Level9": {"length": 1, "source_primary_index": 2}}],'
-    }
-
-    $json = @"
-{
-    "cm_version": "V40",
-    "profile": "$Profile",
-    $defaultBlocks
-    "long_play_mode": false,
-    "level6": {
-        "max_display_mastering_luminance": 1000,
-        "min_display_mastering_luminance": 1,
-        "max_content_light_level": $maxCll,
-        "max_frame_average_light_level": $maxFall
-    },
-    "shots": [
-        {
-            "start": 0,
-            "duration": $FrameCount,
-            "metadata_blocks": [
-                {
-                    "Level1": {
-                        "min_pq": $($Stats.MinPq),
-                        "max_pq": $($Stats.MaxPq),
-                        "avg_pq": $($Stats.AvgPq)
-                    }
-                }
-            ]
-        }
-    ]
-}
-"@
-
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($configPath, $json, $utf8NoBom)
-
-    Invoke-NativeQuiet -Exe $DoviExe -Arguments @('generate', '-j', $configPath, '-o', $rpuPath) -What 'dovi_tool generate'
-
-    if (-not (Test-Path -LiteralPath $rpuPath)) { throw 'RPU 生成失败：找不到输出文件' }
-
-    return @{ RpuPath = $rpuPath; MaxCll = $maxCll; MaxFall = $maxFall }
+    param([string]$DoviExe,[int]$FrameCount,[hashtable]$Stats,[string]$WorkDir)
+    $config=Join-Path $WorkDir 'generator.json'
+    if (-not (Test-Path -LiteralPath $config)) { throw 'Missing final-frame HDR/shot analysis; refusing static fallback metadata.' }
+    $rpu=Join-Path $WorkDir 'RPU.bin'
+    $levels=Join-Path $WorkDir 'rpu-l1.json'
+    $scenes=Join-Path $WorkDir 'rpu-scenes.txt'
+    Invoke-NativeQuiet -Exe $DoviExe -Arguments @('generate','-j',$config,'-o',$rpu) -What 'Shot RPU generation'
+    Invoke-NativeQuiet -Exe $DoviExe -Arguments @('export','-i',$rpu,'-l',('level1='+$levels),'-d',('scenes='+$scenes),'-f','json') -What 'RPU L1/scene export'
+    Invoke-NativeQuiet -Exe $script:CorePython -Arguments @('-X','utf8','-B',(Join-Path $PSScriptRoot 'rpu_audit.py'),$config,$levels,$scenes) -What 'RPU L1/scene verification'
+    return @{RpuPath=$rpu;MaxCll=[int][math]::Round($Stats.MaxNits);MaxFall=[int][math]::Round($Stats.AvgNits)}
 }
 
-# ---------------------------------------------------------------------------
-# MP4：音频 ES 提取 / 转码
-# ---------------------------------------------------------------------------
 function Get-Mp4AudioElementaryStream {
     param(
         [hashtable]$Info,
@@ -847,7 +755,7 @@ function Get-Mp4AudioElementaryStream {
             if ($AudioCodec -eq 'ac3') { $ext = 'ac3'; $format = 'ac3' }
             $outFile = Join-Path $WorkDir ('audio{0}.{1}' -f $index, $ext)
             $args = @('-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', $Info.Path, '-map', ('0:{0}' -f $streamIndex),
-                '-c:a', $AudioCodec, '-b:a', ('{0}k' -f $Bitrate), '-ar', '48000', '-f', $format, $outFile)
+                '-c:a', $AudioCodec, '-b:a', ('{0}k' -f $Bitrate), '-f', $format, $outFile)
         }
 
         Invoke-NativeQuiet -Exe $script:Ffmpeg -Arguments $args -What ('音轨 {0} 处理' -f ($index + 1))
@@ -867,7 +775,11 @@ function Get-Mp4AudioRemuxPlan {
         $stream = $AudioStreams[$index]
         $codec = [string]$stream.codec_name
         $useAlac = ($AudioCodec -eq 'alac' -or
-            ($AudioCodec -eq 'auto' -and $ForBilibili -and $codec -like 'pcm_*'))
+            ($AudioCodec -eq 'auto' -and $codec -like 'pcm_*'))
+        if ($AudioCodec -eq 'auto' -and -not $useAlac -and $codec -notin @('aac','alac','flac','mp3','ac3','eac3','opus')) {
+            throw ('音轨 {0} 的 {1} 编码未在此 MP4 安全复制路径验证；请使用 MKV，或明确选择 copy 并检查兼容性。' -f ($index+1),$codec)
+        }
+        if ($AudioCodec -eq 'copy' -and $codec -like 'pcm_*') { Write-Log '明确选择了 PCM 原码复制：MP4/ipcm 存在平台识别风险，不能据本地通过宣称 Hi-Res 投稿正常。' 'WARN' }
         if (-not $useAlac) { continue }
 
         # ALAC's encoder supports 16 or 24 bits. Refuse float/32-bit sources
@@ -956,9 +868,9 @@ function New-Mp4Output {
         }
         else { Write-Log ('音频原样复制：{0} 条，不改编码、采样率或位深' -f $Info.AudioStreams.Count) }
         $copyArgs = @('-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
-            '-i', $muxOutput, '-i', $Info.Path, '-map', '0:v:0', '-map', '1:a?',
+            '-copyts','-i', $muxOutput, '-ss','0','-i', $Info.Path, '-map', '0:v:0', '-map', '1:a?',
             '-map_metadata', '1', '-map_chapters', '1', '-c', 'copy',
-            '-strict', 'unofficial', '-movflags', '+faststart')
+            '-strict', 'unofficial', '-avoid_negative_ts','disabled','-movflags', '+faststart')
         $copyArgs += @($audioPlan.Arguments) + @('-tag:v', 'hvc1')
         $copyArgs += $OutputPath
         try {
@@ -1000,7 +912,7 @@ function New-MkvOutput {
     }
 
     $remuxArgs = @('-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
-        '-i', $interimMp4, '-ss', '0', '-i', $Info.Path,
+        '-copyts','-i', $interimMp4, '-ss', '0', '-i', $Info.Path,
         '-map', '0:v:0', '-map', '1:a?', '-map', '1:s?',
         '-c', 'copy', '-avoid_negative_ts', 'disabled', '-map_chapters', '1', '-map_metadata', '1',
         $OutputPath)
@@ -1028,7 +940,7 @@ function Test-DolbyVisionInMp4 {
         $dv[0].rpu_present_flag -eq 1 -and $video.color_transfer -eq $script:OutputTransfer)
 }
 
-function Test-RpuInMkv {
+function Test-RpuInContainer {
     param([string]$Path, [string]$DoviExe, [int]$ExpectedFrames, [string]$WorkDir)
     $checkRpu = Join-Path $WorkDir 'check_rpu.bin'
     if (Test-Path -LiteralPath $checkRpu) { Remove-Item -LiteralPath $checkRpu -Force }
@@ -1036,7 +948,7 @@ function Test-RpuInMkv {
     # order. Direct MKV parsing can fail on valid hvc1-derived CodecPrivate.
     $checkHevc = Join-Path $WorkDir 'check_stream.hevc'
     Invoke-NativeQuiet -Exe $script:Ffmpeg -Arguments @('-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
-        '-i', $Path, '-map', '0:v:0', '-c:v', 'copy', '-bsf:v', 'hevc_mp4toannexb', '-f', 'hevc', $checkHevc) -What 'MKV 校验用 Annex B 提取'
+        '-i', $Path, '-map', '0:v:0', '-c:v', 'copy', '-bsf:v', 'hevc_mp4toannexb', '-f', 'hevc', $checkHevc) -What '容器校验用 Annex B 提取'
     & $DoviExe extract-rpu $checkHevc -o $checkRpu 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $checkRpu)) { return $false }
 
@@ -1044,7 +956,11 @@ function Test-RpuInMkv {
     $text = ($raw -join "`n")
     $frames = 0
     if ($text -match 'Frames:\s*(\d+)') { $frames = [int]$Matches[1] }
-    return ($frames -eq $ExpectedFrames)
+    if ($frames -ne $ExpectedFrames) { return $false }
+    $levels=Join-Path $WorkDir 'check_l1.json';$scenes=Join-Path $WorkDir 'check_scenes.txt'
+    Invoke-NativeQuiet -Exe $DoviExe -Arguments @('export','-i',$checkRpu,'-l',('level1='+$levels),'-d',('scenes='+$scenes),'-f','json') -What '最终 RPU L1/镜头导出'
+    Invoke-NativeQuiet -Exe $script:CorePython -Arguments @('-X','utf8','-B',(Join-Path $PSScriptRoot 'rpu_audit.py'),(Join-Path $WorkDir 'generator.json'),$levels,$scenes) -What '最终 RPU L1/镜头校验'
+    return $true
 }
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +988,7 @@ function Convert-SingleFile {
     $suffix = '_DV' + $Profile.Replace('.', '')
     if ($HdrMode -eq 'TrueHDR') {
         if ($BrightnessMapping -eq 'Reference' -and $BrightnessStrength -gt 0) { $suffix = '_Ref' + $suffix }
+        elseif ($BrightnessMapping -eq 'Natural' -and $BrightnessStrength -gt 0) { $suffix = '_Natural' + $suffix }
         $suffix = '_TrueHDR' + $suffix
     }
     if ($Format -eq 'mp4' -or $Format -eq 'both') {
@@ -1111,7 +1028,7 @@ function Convert-SingleFile {
         Write-Log '  输入不含音轨，输出将只有视频。' 'WARN'
     }
     if ([math]::Abs($info.AvgFps - $info.Fps) -gt 0.05) {
-        Write-Log ('  检测到可变帧率（r={0:0.###} / avg={1:0.###}），按固定 {0:0.###}fps 处理，长片可能有轻微音画不同步' -f $info.Fps, $info.AvgFps) 'WARN'
+        throw '检测到可变帧率；当前原始 HEVC 封装不能保留其时间线，不会自动抽帧或补帧。'
     }
 
     # 2. 工作目录（必须 ASCII：Dolby mp4muxer 不支持非 ASCII 路径）
@@ -1123,8 +1040,29 @@ function Convert-SingleFile {
     if (-not $safeName -or $safeName -match '^_*$') { $safeName = 'video' }
     $workDir = Join-Path $tempRoot ('{0}_{1}_{2}' -f $safeName, (Get-Date -Format 'HHmmss'), ([guid]::NewGuid().ToString('N').Substring(0, 8)))
     New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+    Write-TaskEvent -Type 'workspace' -Data @{path=$workDir}
 
     try {
+        Assert-TaskNotCancelled
+        $rateRecord=Get-CoreVideoRate -Path $sourceItem.FullName -WorkDir $workDir -Plan
+        if ($HdrMode -eq 'Original') { $info.SourceFrameCount=[int]$rateRecord.timing.frames }
+        $sourceBps=[long]$rateRecord.video_bitrate.bps
+        $VideoBitrate=[int]$rateRecord.rate_plan.target_kbps
+        $MaxVideoBitrate=[int]$rateRecord.rate_plan.max_kbps
+        if ($VideoBitrate -gt 0 -and $MaxVideoBitrate -lt $VideoBitrate) { throw '码率上限低于源码率匹配目标；请选择 Platform 模式或提高上限。' }
+        if ($BitrateMode -eq 'Quality') { Write-Log ('质量模式：源视频流 {0:0.000} Mbps；不设置目标码率。' -f ($sourceBps/1e6)) }
+        else { Write-Log ('码率策略 {0}：源视频流 {1:0.000} Mbps → 目标 {2:0.000} Mbps，VBV {3:0.000} Mbps（{4}）' -f
+            $BitrateMode,($sourceBps/1e6),($VideoBitrate/1000.0),($MaxVideoBitrate/1000.0),$rateRecord.video_bitrate.method)
+        }
+        if ($Bilibili -and $sourceBps -gt 30000000 -and $BitrateMode -ne 'Platform') { Write-Log '源码率高于B站公开建议的 30 Mbps；保留源码率目标。若要兼容预设，请明确使用 -BitrateMode Platform。' 'WARN' }
+        if ($sourceBps/($info.Width*$info.Height*$info.Fps) -lt .04) { Write-Log '源视频码率相对尺寸/帧率偏低；同码率不能保证 HDR 画质，不会将码率相同称为无损。' 'WARN' }
+        $fileReport=@{source=$sourceItem.FullName;source_video_bps=$sourceBps;target_video_bps=1000L*$VideoBitrate;
+            bitrate_mode=$BitrateMode;source_audio_precheck=@($rateRecord.audio_precheck);outputs=@();platform_playback_verified=$false}
+        if ($Bilibili) {
+            foreach ($audioSpec in @($rateRecord.audio_precheck)) { Write-Log ('Hi-Res 源规格预检：{0} Hz / {1}bit；{2}' -f $audioSpec.sample_rate,$audioSpec.effective_bits,$audioSpec.note) }
+        }
+        if ($VideoBitrate -le 0) { $fileReport.target_video_bps=$null }
+        Write-TaskEvent -Type 'configuration' -Data $fileReport
         $encodeSource = $sourceItem.FullName
         # 3. L1 始终在 PQ 域测量；P8.4 的基础层另行编码为 HLG。
         $zscale = ('zscale=tin={0}:pin={1}:min={2}:rin={3}:p=bt2020:m=bt2020nc:t=smpte2084:npl={4}:r=limited,format=yuv420p10le' -f `
@@ -1151,14 +1089,15 @@ function Convert-SingleFile {
             $applyCachedBrightness = $false
             $hdr10NeedsBrightness = $false
             $toneName = 'neutral'
-            if ($BrightnessMapping -eq 'Reference' -and $BrightnessStrength -gt 0) { $toneName = 'reference' }
+            if ($BrightnessMapping -ne 'Neutral' -and $BrightnessStrength -gt 0) { $toneName = $BrightnessMapping.ToLowerInvariant() }
             $toneStrength = $BrightnessStrength.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
             $skinStrength = $SkinToneCorrection.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
             $toneInfo = $null
             $hdr10Suffix = '_TrueHDR_HDR10.mp4'
             if ($toneName -eq 'reference') { $hdr10Suffix = '_TrueHDR_Ref_HDR10.mp4' }
-            if ($toneName -eq 'reference') {
-                $mappingText = & $script:TrueHDRPython -B (Join-Path $PSScriptRoot 'brightness_mapping.py') --describe --strength $toneStrength --skin-strength $skinStrength
+            elseif ($toneName -eq 'natural') { $hdr10Suffix = '_TrueHDR_Natural_HDR10.mp4' }
+            if ($toneName -ne 'neutral') {
+                $mappingText = & $script:TrueHDRPython -B (Join-Path $PSScriptRoot 'brightness_mapping.py') --describe --mode $toneName --strength $toneStrength --skin-strength $skinStrength
                 if ($LASTEXITCODE -ne 0) { throw '无法读取参考亮度曲线配置。' }
                 $toneInfo = ($mappingText -join "`n") | ConvertFrom-Json
             }
@@ -1192,7 +1131,7 @@ function Convert-SingleFile {
                     $cachedName = 'neutral'
                     if ($cachedTone.name) { $cachedName = $cachedTone.name }
                     if ($cachedName -eq 'neutral') {
-                        $applyCachedBrightness = ($toneName -eq 'reference')
+                        $applyCachedBrightness = ($toneName -ne 'neutral')
                         $hdr10NeedsBrightness = $applyCachedBrightness
                     }
                     elseif ($cachedName -ne $toneName -or $cachedTone.strength -ne $BrightnessStrength -or
@@ -1201,7 +1140,7 @@ function Convert-SingleFile {
                         throw '缓存的亮度或肤色参数不同；不能再次叠加或撤销。请使用匹配参数，或重新生成缓存。'
                     }
                 }
-                else { $pqSource = [string]$cacheInfo.pq; $legacyPq = $true; $hdr10NeedsBrightness = ($toneName -eq 'reference') }
+                else { $pqSource = [string]$cacheInfo.pq; $legacyPq = $true; $hdr10NeedsBrightness = ($toneName -ne 'neutral') }
             }
             else {
                 if ($KeepHDR10) {
@@ -1236,7 +1175,7 @@ function Convert-SingleFile {
                 }
             }
             Write-Log 'PQ→HLG：1000 nit / gamma 1.2 / 理想黑；亮度相关 OOTF，超出 HLG 色体积时等比限制 RGB。'
-            Write-Log 'TrueHDR 不叠加原模式高光曲线；RPU 仍是原有采样估计、全片单段静态元数据。' 'WARN'
+            Write-Log 'TrueHDR 不叠加原模式高光曲线；最终基础层将逐帧统计并生成镜头级社区分析 RPU。'
             if ($KeepHDR10) {
                 $hdr10Target = Join-Path $targetDir ($baseName + $hdr10Suffix)
                 if ((Test-Path -LiteralPath $hdr10Target) -and -not $Force) { throw "HDR10 输出已存在：$hdr10Target" }
@@ -1245,7 +1184,7 @@ function Convert-SingleFile {
                 if ($toneName -eq 'reference') { $hdr10MasteringPeak = 1000 }
                 $hdr10Params = ('lossless=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L({0},1):log-level=error' -f (10000 * $hdr10MasteringPeak))
                 $hdr10Args = @('-hide_banner', '-loglevel', 'warning', '-nostdin', '-y',
-                    '-i', $pqSource, '-i', $sourceItem.FullName, '-map', '0:v:0', '-map', '1:a?',
+                    '-copyts','-i', $pqSource, '-ss','0','-i', $sourceItem.FullName, '-map', '0:v:0', '-map', '1:a?',
                     '-map_metadata', '1', '-map_chapters', '1', '-vf',
                     'zscale=tin=smpte2084:pin=bt2020:min=gbr:rin=full:t=smpte2084:p=bt2020:m=bt2020nc:r=limited,format=yuv420p10le',
                     '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params', $hdr10Params,
@@ -1254,7 +1193,7 @@ function Convert-SingleFile {
                     '-color_range', 'tv', '-movflags', '+faststart', $hdr10Work)
                 if ($hdr10Video) {
                     $hdr10Args = @('-hide_banner', '-loglevel', 'warning', '-nostdin', '-y',
-                        '-i', $hdr10Video, '-i', $sourceItem.FullName, '-map', '0:v:0', '-map', '1:a?',
+                        '-copyts','-i', $hdr10Video, '-ss','0','-i', $sourceItem.FullName, '-map', '0:v:0', '-map', '1:a?',
                         '-map_metadata', '1', '-map_chapters', '1', '-c', 'copy', '-tag:v', 'hvc1',
                         '-strict', 'unofficial', '-movflags', '+faststart', $hdr10Work)
                 }
@@ -1264,7 +1203,7 @@ function Convert-SingleFile {
                     if ($hdr10Video) { $matrix = 'bt2020nc'; $hdr10Input = $hdr10Video }
                     $hdr10Filter = New-ReferenceBrightnessFilter -WorkDir $workDir -Transfer pq -InputMatrix $matrix
                     $hdr10Args = @('-hide_banner', '-loglevel', 'warning', '-nostdin', '-y',
-                        '-i', $hdr10Input, '-i', $sourceItem.FullName, '-map', '0:v:0', '-map', '1:a?',
+                        '-copyts','-i', $hdr10Input, '-ss','0','-i', $sourceItem.FullName, '-map', '0:v:0', '-map', '1:a?',
                         '-map_metadata', '1', '-map_chapters', '1', '-vf', $hdr10Filter,
                         '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params', $hdr10Params,
                         '-fps_mode', 'passthrough', '-tag:v', 'hvc1', '-c:a', 'copy', '-strict', 'unofficial',
@@ -1273,11 +1212,12 @@ function Convert-SingleFile {
                 }
                 $hdr10AudioPlan = Get-Mp4AudioRemuxPlan -AudioStreams $info.AudioStreams -AudioCodec $Mp4AudioCodec -ForBilibili:$Bilibili
                 $hdr10Args = @($hdr10Args[0..($hdr10Args.Count - 2)]) + @($hdr10AudioPlan.Arguments) + @($hdr10Work)
-                Write-Log '保存独立 HDR10/PQ 对照文件（Main10 无损压缩，原音复制）…'
+                Write-Log '保存独立 HDR10/PQ 对照文件（Main10 无损压缩，音轨遵循复制/无损封装策略）…'
                 Invoke-MediaWithProgress -Exe $script:Ffmpeg -Arguments $hdr10Args -WorkDir $workDir `
                     -LogBaseName 'hdr10' -What 'HDR10 对照编码' -Label 'HDR10' -TotalSeconds $info.Duration
                 $hdr10Media = Get-MediaInfo -Path $hdr10Work
                 Test-AlacAudioParameters -Path $hdr10Work -Plan $hdr10AudioPlan
+                $null=Test-CoreAudio -Info $info -Path $hdr10Work -WorkDir $workDir
                 $hdr10Video = @($hdr10Media.streams | Where-Object { $_.codec_type -eq 'video' })[0]
                 if ($hdr10Video.codec_name -ne 'hevc' -or $hdr10Video.profile -ne 'Main 10' -or
                     $hdr10Video.color_transfer -ne 'smpte2084' -or $hdr10Video.color_primaries -ne 'bt2020' -or
@@ -1286,13 +1226,8 @@ function Convert-SingleFile {
             }
         }
 
-        # 4. P8.1 预先分析以写 HDR10 SEI；P8.4 在编码后测量重建画面。
+        # Both profiles are measured from the final reconstructed base layer.
         $stats = $null
-        if ($Profile -eq '8.1') {
-            Write-Log ('分析画面亮度（L1 元数据依据，采样 {0} 帧/秒）…' -f $StatsFps)
-            $stats = Measure-ContentBrightness -SourcePath $sourceItem.FullName -ZscaleChain $zscale -WorkDir $workDir -SampleFps $StatsFps -TotalSeconds $info.Duration
-            Write-Log ('  样本 {0} 个 | 峰值 {1:0.0} nit | 平均 {2:0.0} nit' -f $stats.Samples, $stats.MaxNits, $stats.AvgNits) 'DIM'
-        }
 
         # 5. 编码
         $blHevc = Join-Path $workDir 'BL.hevc'
@@ -1300,11 +1235,9 @@ function Convert-SingleFile {
             $x265Params = 'hdr-opt=0:repeat-headers=1:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:log-level=error'
         }
         else {
-            $maxCll = [int][math]::Max(1, [math]::Round($stats.MaxNits))
-            $maxFall = [int][math]::Max(1, [math]::Round($stats.AvgNits))
-            if ($maxFall -gt $maxCll) { $maxFall = $maxCll }
-            $x265Params = ('hdr-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll={0},{1}:log-level=error' -f $maxCll, $maxFall)
+            $x265Params = 'hdr-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):log-level=error'
         }
+        if ($VideoBitrate -gt 50000) { $x265Params += ':high-tier=1' }
         if ($Lossless) { $x265Params = 'lossless=1:' + $x265Params }
 
         $encodeArgs = @(
@@ -1362,15 +1295,23 @@ function Convert-SingleFile {
         # 6. 帧数 + RPU
         $frameCount = Get-HevcFrameCount -Path $blHevc
         Write-Log ('编码帧数：{0}' -f $frameCount) 'DIM'
-        if ($Profile -eq '8.4') {
-            Write-Log ('从编码后的 HLG 基础层测量亮度（PQ 域，采样 {0} 帧/秒）…' -f $StatsFps)
-            $decodedPq = 'zscale=tin=arib-std-b67:pin=bt2020:min=bt2020nc:rin=limited:t=smpte2084:p=bt2020:m=bt2020nc:npl=1000:r=limited,format=yuv420p10le'
-            if ($HdrMode -eq 'TrueHDR') { $decodedPq = $decodedPq.Replace(':r=limited,', ':r=limited:agamma=0,') }
-            $stats = Measure-ContentBrightness -SourcePath $blHevc -ZscaleChain $decodedPq -WorkDir $workDir -SampleFps $StatsFps -TotalSeconds $info.Duration
-            Write-Log ('  样本 {0} 个 | 编码回读峰值 {1:0.0} nit | 平均 {2:0.0} nit' -f $stats.Samples, $stats.MaxNits, $stats.AvgNits) 'DIM'
+        $analysis=Get-FinalHdrAnalysis -Path $blHevc -Info $info -WorkDir $workDir
+        if ($analysis.frames -ne $frameCount) { throw '逐帧亮度分析帧数与编码帧数不一致。' }
+        if ($HdrMode -eq 'TrueHDR') {
+            $expectedFrames=$cacheInfo.frames
+            if (-not $TrueHDRCache) { $expectedFrames=(Get-Content (Join-Path $workDir 'truehdr-report.json') -Raw -Encoding UTF8 | ConvertFrom-Json).input_frames }
+            if ($frameCount -ne $expectedFrames) { throw '输出帧数与原始解码帧数不一致。' }
         }
+        elseif ($frameCount -ne $info.SourceFrameCount) { throw '输出帧数与原始解码帧数不一致。' }
+        $stats=@{MaxNits=$analysis.max_cll_nits;AvgNits=$analysis.max_fall_nits}
+        $fileReport.hdr=@{max_cll_nits=$analysis.max_cll_nits;max_fall_nits=$analysis.max_fall_nits;
+            max_cie_y_nits=$analysis.max_cie_y_nits;mean_y_nits=$analysis.mean_y_nits;
+            max_frame_fraction_maxrgb_gt1000=$analysis.max_frame_fraction_maxrgb_gt1000;
+            max_frame_fraction_y_gt1100=$analysis.max_frame_fraction_y_gt1100;
+            shots=$analysis.shots;analysis_device=$analysis.analysis_device;analysis_native_yuv_gpu=$analysis.analysis_native_yuv_gpu;
+            l1_analysis_method=$analysis.l1_analysis_method;dolby_analysis_certified=$false}
 
-        Write-Log ('生成 Dolby Vision Profile {0} RPU（静态元数据，CM v4.0 会限制 L1 平均值下限）…' -f $Profile)
+        Write-Log ('生成 Dolby Vision Profile {0} 镜头级 L1 RPU（CM v4.0 有兼容范围约束，非官方认证分析）…' -f $Profile)
         $rpu = New-DvRpu -DoviExe $script:DoviTool -FrameCount $frameCount -Stats $stats -WorkDir $workDir
         Write-Log ('  L6: MaxCLL={0} nit / MaxFALL={1} nit' -f $rpu.MaxCll, $rpu.MaxFall) 'DIM'
 
@@ -1405,6 +1346,10 @@ function Convert-SingleFile {
                 if (-not (Test-DolbyVisionInMp4 -Path $muxTarget)) {
                     throw ('MP4 校验失败：没有找到 DOVI 配置记录 - {0}' -f $target.Path)
                 }
+                if (-not (Test-RpuInContainer -Path $muxTarget -DoviExe $script:DoviTool -ExpectedFrames $frameCount -WorkDir $workDir)) { throw 'MP4 最终流内 RPU 帧数校验失败。' }
+                $audioCheck=Test-CoreAudio -Info $info -Path $muxTarget -WorkDir $workDir
+                $actualRate=Get-CoreVideoRate -Path $muxTarget -WorkDir $workDir -Packets
+                Test-CoreVideoOutput -Info $info -Record $actualRate -ExpectedFrames $frameCount
                 Move-Item -LiteralPath $muxTarget -Destination $target.Path -Force:$Force
                 $results += @{ Path = $target.Path; Size = (Get-Item -LiteralPath $target.Path).Length }
                 Write-Log ('  校验通过：DV Profile {0}，兼容 ID={1}，transfer={2}' -f $Profile, $script:DvCompatibilityId, $script:OutputTransfer) 'OK'
@@ -1413,14 +1358,27 @@ function Convert-SingleFile {
                 Write-Log '封装 MKV（ffmpeg，保留全部音轨/字幕）…'
                 $mkvTarget = Join-Path $workDir 'final_mkv.mkv'
                 New-MkvOutput -Info $info -HevcPath $blDvHevc -OutputPath $mkvTarget -WorkDir $workDir
-                if (-not (Test-RpuInMkv -Path $mkvTarget -DoviExe $script:DoviTool -ExpectedFrames $frameCount -WorkDir $workDir)) {
+                if (-not (Test-RpuInContainer -Path $mkvTarget -DoviExe $script:DoviTool -ExpectedFrames $frameCount -WorkDir $workDir)) {
                     throw ('MKV 校验失败：RPU 缺失或帧数不匹配 - {0}' -f $target.Path)
                 }
+                $audioCheck=Test-CoreAudio -Info $info -Path $mkvTarget -WorkDir $workDir
+                $actualRate=Get-CoreVideoRate -Path $mkvTarget -WorkDir $workDir -Packets
+                Test-CoreVideoOutput -Info $info -Record $actualRate -ExpectedFrames $frameCount
                 Move-Item -LiteralPath $mkvTarget -Destination $target.Path -Force:$Force
                 $results += @{ Path = $target.Path; Size = (Get-Item -LiteralPath $target.Path).Length }
                 Write-Log '  校验通过：RPU 在流内，帧数匹配' 'OK'
             }
+            $deviation=$null
+            if ($VideoBitrate -gt 0) { $deviation=100*($actualRate.video_bitrate.bps/(1000.0*$VideoBitrate)-1) }
+            if ($null -eq $deviation) { Write-Log ('源码率 {0:0.000} / 不设目标 / 实际视频流 {1:0.000} Mbps（质量模式）' -f ($sourceBps/1e6),($actualRate.video_bitrate.bps/1e6)) }
+            else { Write-Log ('源码率 {0:0.000} / 目标 {1:0.000} / 实际视频流 {2:0.000} Mbps；偏差 {3:0.00}%' -f
+                ($sourceBps/1e6),($VideoBitrate/1000.0),($actualRate.video_bitrate.bps/1e6),$deviation) }
+            if ($null -ne $deviation -and [math]::Abs($deviation) -gt 10) { Write-Log '实际平均码率偏离目标超过 10%；已如实报告，未插入填充数据。短片、简单画面或编码器限制可能无法用完目标预算。' 'WARN' }
+            $fileReport.outputs+=@{path=$target.Path;frames=$frameCount;actual_video_bps=$actualRate.video_bitrate.bps;
+                deviation_percent=$deviation;audio=$audioCheck}
         }
+        $script:Results+=$fileReport
+        Write-TaskEvent -Type 'completed' -Data $fileReport
 
         $fileStopwatch.Stop()
         Write-Log ('完成：{0}（用时 {1}）' -f $sourceItem.Name, (Format-Elapsed $fileStopwatch.Elapsed)) 'OK'
@@ -1478,22 +1436,28 @@ function Convert-SingleFile {
 # ===========================================================================
 # 主流程
 # ===========================================================================
+if (-not $script:MachineMode) {
 Write-Host ''
 Write-Host '============================================================' -ForegroundColor DarkCyan
 Write-Host ('  SDR → Dolby Vision 一键转换  v{0}' -f $script:ScriptVersion) -ForegroundColor White
 Write-Host '  支持 PQ / Profile 8.1，以及 HLG / Profile 8.4（B站投稿）' -ForegroundColor DarkCyan
 Write-Host '============================================================' -ForegroundColor DarkCyan
 Write-Host ''
+}
 
 $exitCode = 0
 try {
+    if ($GetCapabilities) {
+        Get-CoreCapabilities | ConvertTo-Json -Depth 10
+        exit 0
+    }
     if (-not $InputPath) {
         Write-Log '没有提供输入路径。' 'ERR'
         Write-Host ''
         Write-Host '  用法：' -ForegroundColor White
         Write-Host '    SDR2DV.ps1 -InputPath "D:\movie.mkv"                  # 默认输出 MP4' -ForegroundColor Gray
         Write-Host '    SDR2DV.ps1 -InputPath "D:\movie.mkv" -Format both    # 同时输出 MP4 + MKV' -ForegroundColor Gray
-        Write-Host '    SDR2DV.ps1 -InputPath "D:\movie.mkv" -Bilibili       # P8.4 / HLG，目标 28 Mbps' -ForegroundColor Gray
+        Write-Host '    SDR2DV.ps1 -InputPath "D:\movie.mkv" -Bilibili       # P8.4 / HLG，匹配源视频流码率' -ForegroundColor Gray
         Write-Host '    SDR2DV.ps1 -InputPath "D:\movies"                    # 批量处理文件夹' -ForegroundColor Gray
         Write-Host '    也可以把视频文件拖到 “一键转DV.bat” 上。' -ForegroundColor Gray
         Write-Host ''
@@ -1507,32 +1471,32 @@ try {
         if ($PSBoundParameters.ContainsKey('Profile') -and $Profile -ne '8.4') { throw '-Bilibili 必须使用 Profile 8.4。' }
         $Profile = '8.4'
         if (-not $PSBoundParameters.ContainsKey('PeakNits')) { $PeakNits = 1000 }
-        if (-not $PSBoundParameters.ContainsKey('VideoBitrate')) { $VideoBitrate = 28000 }
-        if (-not $PSBoundParameters.ContainsKey('MaxVideoBitrate')) { $MaxVideoBitrate = 30000 }
-        if ($VideoBitrate -le 0 -or $VideoBitrate -gt 30000 -or $MaxVideoBitrate -le 0 -or $MaxVideoBitrate -gt 30000) {
-            throw '-Bilibili 使用目标码率模式，视频目标与 VBV 上限须不超过 30000 kbps。'
-        }
     }
     if ($HdrMode -eq 'TrueHDR') {
+        if ($TrueHDRLuminance -ne 1000) { throw '此 SDR→DV8.4 流程固定 1000 nit 参考峰值；不以降低峰值代替正确映射。' }
         if ($PSBoundParameters.ContainsKey('Profile') -and $Profile -ne '8.4') { throw 'TrueHDR 模式要求 -Profile 8.4。' }
         if ($PSBoundParameters.ContainsKey('PeakNits') -and $PeakNits -ne 0) { throw 'TrueHDR 不能叠加 -PeakNits 高光曲线；请用 -TrueHDRLuminance。' }
         if ($PSBoundParameters.ContainsKey('WhitePoint')) { throw 'TrueHDR 不使用 -WhitePoint；请用 -TrueHDRMiddleGray。' }
         if ($Mp4AudioCodec -notin @('auto', 'copy', 'alac')) { throw 'TrueHDR 模式保留原音采样值，请使用 -Mp4AudioCodec auto、copy 或 alac。' }
         $Profile = '8.4'
         $PeakNits = 0
-        $script:TrueHDRPython = Resolve-ToolPath -Name '__truehdr_python__' -Candidates @($TrueHDRPython, (Join-Path $PSScriptRoot '.venv-truehdr\Scripts\python.exe')) -Hint '请先运行 Setup-TrueHDR.ps1，或用 -TrueHDRPython 指定独立环境。'
+        $script:TrueHDRPython = Resolve-ToolPath -Name '__truehdr_python__' -Candidates @($TrueHDRPython,(Get-ConfiguredTool 'truehdr_python'),(Join-Path $PSScriptRoot '.venv-truehdr\Scripts\python.exe')) -Hint '请先运行 Setup-TrueHDR.ps1，或用 -TrueHDRPython 指定独立环境。'
     }
     elseif ($KeepHDR10 -or $TrueHDRDebandingOff -or $PSBoundParameters.ContainsKey('BrightnessMapping') -or
         $PSBoundParameters.ContainsKey('SkinToneCorrection') -or
         $PSBoundParameters.ContainsKey('BrightnessStrength') -or @($PSBoundParameters.Keys | Where-Object { $_ -like 'TrueHDR*' }).Count -gt 0) {
         throw 'TrueHDR 参数需要 -HdrMode TrueHDR。'
     }
-    if ($VideoBitrate -gt 0) {
-        if ($Lossless -or $PSBoundParameters.ContainsKey('Crf')) { throw '-VideoBitrate 不能与 -Crf 或 -Lossless 同用。' }
-        if ($MaxVideoBitrate -eq 0) { $MaxVideoBitrate = [int][math]::Min(200000, [math]::Ceiling(1.1 * $VideoBitrate)) }
-        if ($MaxVideoBitrate -lt $VideoBitrate) { throw '-MaxVideoBitrate 不能小于 -VideoBitrate。' }
+    if ($PSBoundParameters.ContainsKey('VideoBitrate') -and -not $PSBoundParameters.ContainsKey('BitrateMode')) {
+        if ($VideoBitrate -gt 0) { $BitrateMode='Custom' } else { $BitrateMode='Quality' }
     }
-    elseif ($MaxVideoBitrate -gt 0) { throw '-MaxVideoBitrate 需要同时指定正数 -VideoBitrate。' }
+    if ($Lossless -or $PSBoundParameters.ContainsKey('Crf') -or $PSBoundParameters.ContainsKey('NvencCq')) {
+        if ($VideoBitrate -gt 0 -or ($PSBoundParameters.ContainsKey('BitrateMode') -and $BitrateMode -ne 'Quality')) { throw '质量/无损模式不能和目标码率策略混用。' }
+        $BitrateMode='Quality'
+    }
+    if ($BitrateMode -eq 'Custom' -and $VideoBitrate -le 0) { throw 'Custom 模式需要正数 -VideoBitrate（kbps）。' }
+    if ($BitrateMode -eq 'Quality' -and $MaxVideoBitrate -gt 0) { throw '质量模式不接受单独的码率上限。' }
+    $script:CorePython=Get-CorePython
     $script:DvCompatibilityId = 1
     $script:OutputTransfer = 'smpte2084'
     if ($Profile -eq '8.4') {
@@ -1569,6 +1533,24 @@ try {
 
     $script:WorkRoot = Get-AsciiWorkRoot
     Write-Log ('  临时目录 : {0}' -f $script:WorkRoot) 'DIM'
+    if ($DescribeInput) {
+        $probeDir=Join-Path $script:WorkRoot ('probe_'+[guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $probeDir | Out-Null
+        try {
+            $description=Get-CoreVideoRate -Path $InputPath -WorkDir $probeDir -Plan
+            $sourceInfo=Get-IncomingVideoInfo -Path $InputPath
+            $audioPlan=$null;$audioError=$null;$alacError=$null
+            try { $audioPlan=Get-Mp4AudioRemuxPlan -AudioStreams $sourceInfo.AudioStreams -AudioCodec 'auto' -ForBilibili:$Bilibili } catch { $audioError=$_.Exception.Message }
+            try { $null=Get-Mp4AudioRemuxPlan -AudioStreams $sourceInfo.AudioStreams -AudioCodec 'alac' -ForBilibili:$Bilibili } catch { $alacError=$_.Exception.Message }
+            @{schema=1;path=$InputPath;media=$description.media;video_bitrate=$description.video_bitrate;rate_plan=$description.rate_plan;audio_precheck=@($description.audio_precheck);truehdr_input_error=$description.truehdr_input_error;audio_plan=$audioPlan;audio_plan_error=$audioError;alac_plan_error=$alacError} | ConvertTo-Json -Depth 14
+        }
+        finally {
+            $fullProbe=[IO.Path]::GetFullPath($probeDir)
+            if ([IO.Path]::GetDirectoryName($fullProbe) -eq [IO.Path]::GetFullPath($script:WorkRoot).TrimEnd('\') -and
+                (((Get-Item -LiteralPath $fullProbe).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) { Remove-Item -LiteralPath $fullProbe -Recurse -Force }
+        }
+        exit 0
+    }
     if ($Encoder -eq 'NVENC' -and $Profile -ne '8.4') { throw 'NVENC 当前仅支持 Profile 8.4 / HLG；8.1 / HDR10 基础层请使用 -Encoder x265。' }
     if ($Encoder -eq 'NVENC' -and $PSBoundParameters.ContainsKey('Crf')) { throw 'NVENC 质量模式请用 -NvencCq；需要 CRF 时使用 -Encoder x265。' }
     if ($Encoder -eq 'Auto' -and ($Profile -ne '8.4' -or $PSBoundParameters.ContainsKey('Crf'))) { $Encoder = 'x265' }
@@ -1587,7 +1569,7 @@ try {
     if ($inputItem.PSIsContainer) {
         $files = @(Get-ChildItem -LiteralPath $inputItem.FullName -File -ErrorAction SilentlyContinue |
             Where-Object { $videoExtensions -contains $_.Extension.ToLowerInvariant() } |
-            Where-Object { $_.Name -notmatch '_DV(81|84)\.|_TrueHDR(_Ref)?_HDR10\.' } |
+            Where-Object { $_.Name -notmatch '_DV(81|84)\.|_TrueHDR(_Ref|_Natural)?_HDR10\.' } |
             Sort-Object Name)
         if ($files.Count -eq 0) { throw '文件夹里没有找到可处理的视频文件。' }
         Write-Log ('批量模式：找到 {0} 个文件' -f $files.Count) 'STEP'
@@ -1606,6 +1588,7 @@ try {
             $succeeded += $file.Name
         }
         catch {
+            if ($CancelFile -and (Test-Path -LiteralPath $CancelFile)) { $exitCode=130;Write-TaskEvent -Type 'cancelled' -Data @{message='本次任务已取消'};break }
             $failed += @{ Name = $file.Name; Error = $_.Exception.Message }
             Write-Log ('失败：{0} → {1}' -f $file.Name, $_.Exception.Message) 'ERR'
         }
@@ -1627,6 +1610,16 @@ catch {
     Write-Host ''
     Write-Log ($_.Exception.Message) 'ERR'
     $exitCode = 1
+}
+
+finally {
+    $env:SDR2DV_CANCEL_FILE=$savedCancelEnvironment
+    if ($savedConsoleEncoding) { [Console]::OutputEncoding=$savedConsoleEncoding }
+    if ($ReportPath) {
+        [IO.File]::WriteAllText([IO.Path]::GetFullPath($ReportPath),
+            (@{schema=1;results=$script:Results;exit_code=$exitCode;platform_playback_verified=$false} | ConvertTo-Json -Depth 24),
+            (New-Object Text.UTF8Encoding($false)))
+    }
 }
 
 exit $exitCode

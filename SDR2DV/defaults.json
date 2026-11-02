@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "peak_nits": 1000,
+  "brightness_mapping": "Neutral",
+  "brightness_strength": 1.0,
+  "skin_tone_correction": 0.0,
+  "reference_skin_tone_correction": 0.5,
+  "encoder": "Auto",
+  "nvenc_preset": "p6",
+  "nvenc_cq": 18,
+  "preset": "medium",
+  "crf": 17,
+  "format": "mp4",
+  "bitrate_mode": "Source",
+  "audio_codec": "auto",
+  "platform_target_kbps": 28000,
+  "platform_max_kbps": 30000,
+  "natural_status": "experimental_pending_display_review"
+}

@@ -60,6 +60,35 @@ try {
         $resolved[$kind] = $path
         Write-Host ('  {0}: {1}' -f $kind, $path)
     }
+    # Standard conversion now also uses the lightweight Python analysis core.
+    # Install into a separate project venv; never pip-install into system Python.
+    $tuiPython=Join-Path $PSScriptRoot 'SDR2DV\.venv-tui\Scripts\python.exe'
+    if ($CheckOnly) {
+        & (Join-Path $PSScriptRoot 'SDR2DV\Setup-Tui.ps1') -CheckOnly
+    }
+    else {
+        $baseCandidates=@($Python,$tuiPython,(Join-Path $PSScriptRoot 'SDR2DV\.venv-truehdr\Scripts\python.exe'))
+        if ($existing -and $existing.tools.truehdr_python) { $baseCandidates += [string]$existing.tools.truehdr_python }
+        $basePython=Find-DeployPython -Candidates $baseCandidates
+        if (-not $basePython -and -not $Portable) {
+            $launcher=Get-Command py.exe -ErrorAction SilentlyContinue
+            if ($launcher) {
+                $found=Invoke-DeployProbe $launcher.Source @('-3.11','-c','import sys;print(sys.executable)')
+                if ($found.Code -eq 0) { $basePython=Find-DeployPython -Candidates @($found.Text.Trim()) }
+            }
+        }
+        if (-not $basePython) {
+            $uv=Install-DeployAsset -Kind uv -Asset $assets.uv -ToolsDirectory $toolsDirectory -CacheDirectory $CacheDirectory
+            $pythonDir=Join-Path $toolsDirectory 'python'
+            & $uv python install 3.11 --install-dir $pythonDir --no-bin --no-registry --no-config --system-certs --cache-dir (Join-Path $toolsDirectory 'uv-cache')
+            if ($LASTEXITCODE -ne 0) { throw 'Managed Python installation failed.' }
+            $basePython=Find-DeployPython -Candidates @(Get-ChildItem -LiteralPath $pythonDir -Recurse -File -Filter python.exe | ForEach-Object FullName)
+        }
+        & (Join-Path $PSScriptRoot 'SDR2DV\Setup-Tui.ps1') -Python $basePython
+    }
+    if ($LASTEXITCODE -ne 0) { throw 'TUI/core environment setup failed.' }
+    $resolved.core_python=$tuiPython
+    if ($existing -and $existing.tools.truehdr_python) { $resolved.truehdr_python=[string]$existing.tools.truehdr_python }
     if ($enableTrueHDR) {
         $venvPython = Join-Path $PSScriptRoot 'SDR2DV\.venv-truehdr\Scripts\python.exe'
         if ($CheckOnly) {
@@ -89,6 +118,7 @@ try {
             & (Join-Path $PSScriptRoot 'SDR2DV\Setup-TrueHDR.ps1') -Python $pythonPath
         }
         if ($LASTEXITCODE -ne 0) { throw 'TrueHDR setup or inference check failed.' }
+        $resolved.truehdr_python=$venvPython
     }
     if (-not $CheckOnly) {
         New-Item -ItemType Directory -Path $toolsDirectory -Force | Out-Null

@@ -101,6 +101,7 @@ def check(args):
 
 
 def timing(args, video):
+    from task_io import check_cancel
     fps = Fraction(video['r_frame_rate'])
     if fps <= 0:
         raise ValueError('TrueHDR requires a known CFR frame rate')
@@ -113,6 +114,7 @@ def timing(args, video):
     count = 0
     try:
         for line in p.stdout:
+            check_cancel()
             field = line.strip().split(',')[0]
             if not field:
                 continue
@@ -145,9 +147,8 @@ def read_frame(pipe, n):
     return parts
 
 
-def source_plan(args):
-    media = run_json([args.ffprobe, '-v', 'error', '-show_streams', '-of', 'json', args.input])
-    video = next(s for s in media['streams'] if s['codec_type'] == 'video')
+def source_video_filter(video):
+    """Metadata-only preflight, shared with the core's TUI probe."""
     if video.get('color_transfer') in ('smpte2084', 'arib-std-b67'):
         raise ValueError('TrueHDR accepts SDR only')
     for field in ('color_transfer', 'color_space', 'color_primaries', 'color_range'):
@@ -157,14 +158,18 @@ def source_plan(args):
         raise ValueError('Unsupported source matrix for TrueHDR input conversion')
     if video.get('color_transfer') not in ('bt709', 'gamma22', 'gamma28', 'smpte170m', 'iec61966-2-1'):
         raise ValueError('Unsupported SDR transfer for TrueHDR input conversion')
+    if video.get('color_primaries') in ('bt2020','smpte431','smpte432'):
+        raise ValueError('TrueHDR SDK input is Rec.709; refusing implicit wide-gamut SDR clipping. Use Original mode.')
     if video.get('sample_aspect_ratio', '1:1') not in ('1:1', '0:1', 'N/A'):
         raise ValueError('TrueHDR currently requires square pixels; no implicit aspect-ratio change')
     if any(abs(float(item.get('rotation', 0))) > .001 for item in video.get('side_data_list', [])):
         raise ValueError('TrueHDR currently requires unrotated input; no implicit rotation/resize')
-    fps, expected = timing(args, video)
-    if any(abs(float(s.get('start_time', 0))) > .0011 for s in media['streams']
-           if s['codec_type'] == 'audio'):
-        raise ValueError('TrueHDR currently requires audio start PTS=0; no implicit offset removal')
+    bits=int(video.get('bits_per_raw_sample') or 0)
+    verified_8bit={'yuv420p','yuv422p','yuv444p','yuv440p','yuv411p','yuv410p',
+        'yuvj420p','yuvj422p','yuvj444p','yuvj440p','nv12','nv21','yuyv422','uyvy422',
+        'rgb24','bgr24','rgba','bgra','argb','abgr','rgb0','bgr0','0rgb','0bgr','gbrp','gray','gray8'}
+    if bits>8 or video.get('pix_fmt') not in verified_8bit:
+        raise ValueError('NVIDIA TrueHDR SDK accepts 8bit SDR input; rejecting implicit 10/12/16bit -> 8bit conversion. Use Original mode.')
     w, h = video['width'], video['height']
     if w % 2 or h % 2:
         raise ValueError('Main10 yuv420 output requires even input dimensions')
@@ -175,7 +180,15 @@ def source_plan(args):
     chain = (f"zscale=tin={transfer}:pin={video['color_primaries']}:"
              f"min={video['color_space']}:rin={in_range}:t=bt470m:p=bt709:m=gbr:r=full:agamma=0,"
              'format=gbrp,format=rgb24')
-    return video, fps, expected, chain
+    return chain
+
+
+def source_plan(args):
+    media=run_json([args.ffprobe,'-v','error','-show_streams','-of','json',args.input])
+    video=next(s for s in media['streams'] if s['codec_type']=='video')
+    chain=source_video_filter(video)
+    fps,expected=timing(args,video)
+    return video,fps,expected,chain
 
 
 def convert(args):

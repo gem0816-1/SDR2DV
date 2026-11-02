@@ -10,7 +10,7 @@
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\Deploy.ps1                          # 自动选择模式
-.\Deploy.ps1 -Mode Standard           # 只准备普通转换
+.\Deploy.ps1 -Mode Standard           # 准备普通转换、TUI与分析核心
 .\Deploy.ps1 -Mode TrueHDR            # 同时准备并检查 TrueHDR
 .\Deploy.ps1 -CheckOnly               # 只检查，不下载或重写配置
 .\Deploy.ps1 -Mode Standard -Portable # 强制使用项目内工具
@@ -19,9 +19,11 @@ Set-ExecutionPolicy -Scope Process Bypass
 工具和 CUDA 依赖不会添加到系统 PATH；部署不会处理视频、启动播放器或创建计划任务。
 转换脚本从 `.tools/tools.json` 读取经过检查的工具路径；显式 `-DoviTool` / `-Mp4Muxer` 参数优先。
 默认可复用 PATH 中的工具及已有本地工具；`-Portable` 限制为项目内工具，显式提供的路径除外。
-TrueHDR 已有依赖版本正确时跳过安装，执行 `pip check`、参考亮度/肤色模块检查和真实推理检查。
+TrueHDR 已有依赖版本正确时跳过安装，执行 `pip check`、亮度模块检查和真实推理检查。
 未找到合适 Python 时，通过固定版本 uv 下载项目内 Python 3.11，不注册 Windows Python、不创建全局命令。
 部署不安装显卡驱动；驱动、GPU、操作系统和显示器需满足 [NVIDIA SDK 条件](https://docs.nvidia.com/maxine/vfx/latest/WindowsVFXSDK/GetStartedonWindows.html)。
+
+TUI固定依赖见 `SDR2DV/tui-requirements.txt`，部署创建项目 `.venv-tui`；已有正确版本时只检查，避免反复安装。普通转换现在也需要该轻量分析环境，系统Python不会被安装包污染。
 
 ## 本地文件与缓存
 
@@ -32,8 +34,10 @@ TrueHDR 已有依赖版本正确时跳过安装，执行 `pip check`、参考亮
 | `.tools/packages` | 按次解压的外部工具，保留其许可证及附带文件 |
 | `.tools/mp4muxer` | Windows 发布包自带的封装器、许可证及构建说明 |
 | `.tools/python` / `.tools/uv-cache` | 自动安装的 Python 及 uv 缓存 |
-| `.tools/pip-cache` | TrueHDR Python 包缓存 |
+| `.tools/pip-cache` | TUI / TrueHDR Python 包缓存 |
+| `SDR2DV/.venv-tui` | Rich、Questionary、NumPy；界面与普通转换分析核心 |
 | `SDR2DV/.venv-truehdr` | TrueHDR 独立虚拟环境 |
+| `.tools/tui-runs` | 按次隔离的界面日志、事件及校验报告（不含媒体缓存） |
 
 可用 `-CacheDirectory "D:\sdr2dv-downloads"` 指定工具 ZIP 缓存目录。
 下载 URL、版本和 SHA256 固定在 `scripts/deploy-assets.json`。已有缓存哈希不符时明确报错，不自动执行或覆盖该文件。
