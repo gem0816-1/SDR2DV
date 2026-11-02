@@ -11,6 +11,7 @@ import subprocess
 import numpy as np
 from hdr_math import pq_eotf, hlg_eotf, luminance
 from truehdr_backend import read_frame, CREATE_FLAGS
+from pipe_io import CHUNK_BYTES
 
 
 def analyze(path, fps, prefix):
@@ -25,7 +26,8 @@ def analyze(path, fps, prefix):
     chain = (f'fps={fps},zscale=tin={transfer}:pin=bt2020:min={matrix}:rin={ran}:'
              f't={transfer}:p=bt2020:m=gbr:r=full:agamma=0,format=gbrpf32le')
     cmd = ['ffmpeg', '-v', 'error', '-nostdin', '-noautorotate', '-i', path,
-           '-map', '0:v:0', '-vf', chain, '-an', '-sn', '-dn', '-f', 'rawvideo', 'pipe:1']
+           '-map', '0:v:0', '-vf', chain, '-an', '-sn', '-dn', '-f', 'rawvideo',
+           '-blocksize', str(CHUNK_BYTES), 'pipe:1']
     hist = np.zeros(100001, np.int64)
     peak = rgb_peak = total = 0.
     pixels = high203 = high400 = high800 = boundary = negative = 0

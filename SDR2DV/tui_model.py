@@ -96,7 +96,7 @@ class ConversionConfig:
         if not capabilities.get('muxer_ready'):raise ValueError('缺少 Dolby mp4muxer，请先部署')
         if self.audio_codec not in ('auto','copy','alac'):raise ValueError('TUI 不提供隐式有损音频处理')
         if self.audio_codec=='alac' and self.container=='mkv':raise ValueError('MKV 路径原样复制音频；ALAC 封装策略只用于 MP4')
-        if description and self.container!='mkv' and self.audio_codec in ('auto','alac'):
+        if description and (self.container!='mkv' or self.hdr10) and self.audio_codec in ('auto','alac'):
             error=description.get('audio_plan_error' if self.audio_codec=='auto' else 'alac_plan_error')
             if error:raise ValueError(error)
         if self.bitrate_mode=='Custom' and self.video_bitrate<=0:raise ValueError('自定义视频码率必须为正数 kbps')
@@ -134,6 +134,20 @@ class ConversionConfig:
         for enabled,flag in ((self.lossless,'-Lossless'),(self.hdr10,'-KeepHDR10'),(self.keep_temp,'-KeepTemp'),(self.force,'-Force')):
             if enabled:args.append(flag)
         return args
+
+
+def planned_outputs(config):
+    """Display the core's existing filenames, without creating or probing media."""
+    source = Path(normalize_path(config.input_path))
+    folder = Path(normalize_path(config.output_dir)) if config.output_dir else source.parent
+    tone = ''
+    if config.hdr_mode == 'TrueHDR' and config.brightness_strength > 0:
+        tone = {'Reference': '_Ref', 'Natural': '_Natural'}.get(config.mapping, '')
+    prefix = source.stem + ('_TrueHDR' + tone if config.hdr_mode == 'TrueHDR' else '')
+    extensions = ('mp4', 'mkv') if config.container == 'both' else (config.container,)
+    paths = [folder / (prefix + '_DV' + config.profile.replace('.', '') + '.' + ext) for ext in extensions]
+    if config.hdr10: paths.append(folder / (prefix + '_HDR10.mp4'))
+    return paths
 
 
 def encoder_options(capabilities,hdr_mode='TrueHDR',lossless=False):

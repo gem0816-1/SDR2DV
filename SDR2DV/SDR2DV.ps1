@@ -225,7 +225,7 @@ param(
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '2.0.0-dev'
+$script:ScriptVersion = '2.0.0'
 . (Join-Path $PSScriptRoot 'encoding.ps1')
 . (Join-Path $PSScriptRoot 'core.ps1')
 $script:Defaults = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'defaults.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -397,6 +397,7 @@ function Invoke-MediaWithProgress {
     $startTime = Get-Date
     $lastUpdate = $startTime
     $printed = $false
+    $lastProgressLabel = $Label
 
     while (-not $proc.HasExited) {
         Assert-TaskNotCancelled
@@ -409,27 +410,38 @@ function Invoke-MediaWithProgress {
         if (-not (Test-Path -LiteralPath $progLog)) { continue }
 
         $text = ''
-        try { $text = [System.IO.File]::ReadAllText($progLog) } catch { $text = '' }
+        try {
+            $progressFile = [IO.File]::Open($progLog,[IO.FileMode]::Open,[IO.FileAccess]::Read,
+                ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            $progressReader = New-Object IO.StreamReader($progressFile)
+            try { $text = $progressReader.ReadToEnd() } finally { $progressReader.Dispose() }
+        } catch { $text = '' }
         if (-not $text) { continue }
 
         $frame = 0
         $speed = ''
         $outSeconds = 0.0
+        $progressLabel = $Label
         foreach ($line in ($text -split "`n")) {
             $t = $line.Trim()
             if ($t -match '^frame=(\d+)') { $frame = [int]$Matches[1] }
             elseif ($t -match '^speed=(.+)$') { $speed = $Matches[1].Trim() }
             elseif ($t -match '^out_time_us=(\d+)') { $outSeconds = [double]$Matches[1] / 1000000.0 }
+            elseif ($t -eq 'phase=source_timing') { $progressLabel = '源时间线检查' }
         }
 
-        $status = ('   {0} frame={1}' -f $Label, $frame)
+        if ($progressLabel -ne $lastProgressLabel) {
+            Write-TaskEvent -Type 'stage' -Data @{stage=$progressLabel;process_id=$proc.Id}
+            $lastProgressLabel = $progressLabel
+        }
+        $status = ('   {0} frame={1}' -f $progressLabel, $frame)
         if ($TotalSeconds -gt 0 -and $outSeconds -gt 0) {
             $pct = [math]::Min(100.0, 100.0 * $outSeconds / $TotalSeconds)
             $status += ('  {0,5:0.0}%' -f $pct)
         }
         if ($speed) { $status += ('  speed={0}' -f $speed) }
         $status += ('  已用 {0}' -f (Format-Elapsed ([TimeSpan]::FromSeconds((($now - $startTime).TotalSeconds)))))
-        Write-TaskEvent -Type 'progress' -Data @{stage=$Label;frame=$frame;seconds=$outSeconds;total_seconds=$TotalSeconds;
+        Write-TaskEvent -Type 'progress' -Data @{stage=$progressLabel;frame=$frame;seconds=$outSeconds;total_seconds=$TotalSeconds;
             elapsed_seconds=($now-$startTime).TotalSeconds;speed=$speed;fps=($frame/[math]::Max(.001,($now-$startTime).TotalSeconds))}
         if (-not $script:MachineMode) { Write-Host ("`r" + $status.PadRight(88)) -NoNewline }
         $printed = $true
@@ -1387,6 +1399,9 @@ function Convert-SingleFile {
         }
     }
     catch {
+        if (-not ($_.Exception -is [OperationCanceledException])) {
+            $null = Save-CoreFailureDiagnostics -WorkDir $workDir -Failure $_
+        }
         if ($KeepTemp) {
             try {
                 [IO.File]::WriteAllText((Join-Path $workDir 'failure.txt'),

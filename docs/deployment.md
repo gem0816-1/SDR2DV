@@ -68,7 +68,7 @@ Release 同时提供主 ZIP、封装器 ZIP、对应的上游源 ZIP 和 `SHA256
 核对下载包：
 
 ```powershell
-Get-FileHash .\SDR2DV-v1.10.0-win-x64.zip -Algorithm SHA256
+Get-FileHash .\SDR2DV-v2.0.0-win-x64.zip -Algorithm SHA256
 ```
 
 源码回归：`powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Deploy.Tests.ps1`。

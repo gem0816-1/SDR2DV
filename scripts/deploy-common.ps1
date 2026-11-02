@@ -80,7 +80,7 @@ function Get-DeployDownload {
             try {
                 Write-Host ('Download: {0} (attempt {1}/3)' -f $Asset.file, $attempt)
                 $request = @{ Uri = $Asset.url; OutFile = $partial; UseBasicParsing = $true;
-                    TimeoutSec = 600; UserAgent = 'SDR2DV-deploy/1.8.0'; ErrorAction = 'Stop' }
+                    TimeoutSec = 600; UserAgent = 'SDR2DV-deploy/2.0.0'; ErrorAction = 'Stop' }
                 if ($env:HTTPS_PROXY) { $request.Proxy = $env:HTTPS_PROXY }
                 Invoke-WebRequest @request
                 break

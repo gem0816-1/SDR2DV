@@ -19,9 +19,20 @@ def write_json(path,data):
     target.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
 
 
-def progress(path,frames,seconds=0):
+def progress(path,frames,seconds=0,phase=None,ended=False):
     if path:
-        Path(path).write_text(f'frame={frames}\nout_time_us={int(seconds*1e6)}\n',encoding='ascii')
+        phase_line=f'phase={phase}\n' if phase else ''
+        end_line='progress=end\n' if ended else ''
+        target=Path(path)
+        staging=target.with_name(target.name+f'.{os.getpid()}.writing')
+        # Readers see a complete update. A transient Windows sharing violation
+        # affects this optional UI update, never the video/audio conversion.
+        try:
+            staging.write_text(f'frame={frames}\nout_time_us={int(seconds*1e6)}\n'+phase_line+end_line,encoding='ascii')
+            os.replace(staging,target)
+        except PermissionError:
+            return False
+        return True
 
 
 def json_command(command):

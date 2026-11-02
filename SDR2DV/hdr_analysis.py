@@ -14,6 +14,7 @@ import tempfile
 import time
 
 import numpy as np
+from pipe_io import CHUNK_BYTES
 from media_probe import frame_rate,probe
 from task_io import CREATE_FLAGS,check_cancel,progress,write_json
 
@@ -22,7 +23,7 @@ def fill_frame(pipe,view):
     """Reuse one frame buffer instead of allocating/copying 4K RGB bytes twice."""
     offset=0
     while offset<len(view):
-        count=pipe.readinto(view[offset:])
+        count=pipe.readinto(view[offset:offset+CHUNK_BYTES])
         if not count:
             if offset:raise RuntimeError('Truncated decoded HDR frame')
             return False
@@ -171,7 +172,8 @@ def analyze(path,output,generator=None,ffmpeg='ffmpeg',ffprobe='ffprobe',fps=Non
     command=[ffmpeg,'-v','error','-nostdin','-threads',str(min(8,os.cpu_count() or 1)),'-i',str(path),'-map','0:v:0']
     command+=['-pix_fmt','yuv420p10le'] if native_gpu else ['-vf',chain]
     command+=[
-             '-fps_mode','passthrough','-an','-sn','-dn','-f','rawvideo','pipe:1']
+             '-fps_mode','passthrough','-an','-sn','-dn','-f','rawvideo',
+             '-blocksize',str(CHUNK_BYTES),'pipe:1']
     frames=[];detector=SceneDetector(max(8,round(rate*.3)));start=time.monotonic()
     count=width*height*3//2 if native_gpu else width*height*3
     dtype='<u2' if native_gpu else '<f4';nbytes=count*np.dtype(dtype).itemsize

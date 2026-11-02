@@ -18,6 +18,7 @@ import time
 from fractions import Fraction
 
 from hdr_math import pq_to_hlg_filter
+from pipe_io import CHUNK_BYTES, write_frame
 
 CREATE_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
@@ -101,7 +102,7 @@ def check(args):
 
 
 def timing(args, video):
-    from task_io import check_cancel
+    from task_io import check_cancel, progress
     fps = Fraction(video['r_frame_rate'])
     if fps <= 0:
         raise ValueError('TrueHDR requires a known CFR frame rate')
@@ -112,6 +113,7 @@ def timing(args, video):
                          text=True, creationflags=CREATE_FLAGS)
     last = None
     count = 0
+    progress(getattr(args,'progress',None),0,0,phase='source_timing')
     try:
         for line in p.stdout:
             check_cancel()
@@ -125,6 +127,8 @@ def timing(args, video):
                 raise ValueError('TrueHDR currently rejects VFR/discontinuous PTS to protect audio sync')
             last = t
             count += 1
+            if count % 120 == 0:
+                progress(getattr(args,'progress',None),count,count/float(fps),phase='source_timing')
         err = p.stderr.read()
         if p.wait() or count == 0:
             raise RuntimeError(f'PTS scan failed: {err}')
@@ -138,7 +142,7 @@ def timing(args, video):
 def read_frame(pipe, n):
     parts = bytearray()
     while len(parts) < n:
-        data = pipe.read(n - len(parts))
+        data = pipe.read(min(CHUNK_BYTES, n - len(parts)))
         if not data:
             break
         parts.extend(data)
@@ -202,10 +206,11 @@ def convert(args):
         raise FileExistsError(path)
     dec_cmd = [args.ffmpeg, '-hide_banner', '-v', 'error', '-nostdin', '-noautorotate',
                '-i', args.input, '-map', '0:v:0', '-an', '-sn', '-dn', '-vf', chain,
-               '-fps_mode', 'passthrough', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']
+               '-fps_mode', 'passthrough', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+               '-blocksize', str(CHUNK_BYTES), 'pipe:1']
     enc_cmd = [args.ffmpeg, '-hide_banner', '-v', 'error', '-nostdin', '-n',
                '-f', 'rawvideo', '-pixel_format', 'x2bgr10le', '-video_size', f'{w}x{h}',
-               '-framerate', str(fps), '-i', 'pipe:0', '-an', '-vf', 'format=gbrp10le',
+               '-framerate', str(fps), '-blocksize', str(CHUNK_BYTES), '-i', 'pipe:0', '-an', '-vf', 'format=gbrp10le',
                '-c:v', 'ffv1', '-level', '3', '-coder', '1', '-context', '1', '-g', '1',
                '-slicecrc', '1', '-color_primaries', 'bt2020', '-color_trc', 'smpte2084',
                '-colorspace', 'rgb', '-color_range', 'pc', str(path)]
@@ -242,10 +247,11 @@ def convert(args):
                     raw = cp.asnumpy(out).astype('<u4', copy=False)
                     # Ignore alpha in verification; preserve the 30 RGB bits.
                     digest.update((raw & np.uint32(0x3fffffff)).tobytes())
-                    encoder.stdin.write(raw.tobytes())
+                    write_frame(encoder.stdin,raw,label='PQ cache',frame_number=count+1)
                     count += 1
                     if count % 15 == 0 and args.progress:
-                        Path(args.progress).write_text(f'frame={count}\nout_time_us={int(count / float(fps) * 1e6)}\n')
+                        from task_io import progress
+                        progress(args.progress,count,count/float(fps))
             encoder.stdin.close()
             if decoder.wait() or encoder.wait():
                 raise RuntimeError('FFmpeg failed; see PQ decode/encode logs')

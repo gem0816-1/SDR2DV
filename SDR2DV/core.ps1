@@ -30,6 +30,44 @@ function Write-TaskEvent {
         (($record | ConvertTo-Json -Depth 12 -Compress) + "`n"), (New-Object Text.UTF8Encoding($false)))
 }
 
+function Save-CoreFailureDiagnostics {
+    param([string]$WorkDir, [object]$Failure)
+    try {
+        $parent = ''
+        if ($EventPath) { $parent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($EventPath)) }
+        elseif ($ReportPath) { $parent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ReportPath)) }
+        else { $parent = Join-Path (Split-Path $PSScriptRoot -Parent) '.tools\failures' }
+        $destination = Join-Path $parent ('diagnostics_' + [IO.Path]::GetFileName($WorkDir))
+        New-Item -ItemType Directory -Path $destination -Force | Out-Null
+        $utf8 = New-Object Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText((Join-Path $destination 'failure.txt'),
+            ($Failure.Exception.Message + "`r`n" + $Failure.ScriptStackTrace), $utf8)
+        # Only small text diagnostics from this task. No media or external cache.
+        foreach ($file in (Get-ChildItem -LiteralPath $WorkDir -File)) {
+            if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                ($file.Extension -ne '.log' -and $file.Name -notin @('truehdr-report.json','hdr-analysis.json'))) { continue }
+            $stream = [IO.File]::OpenRead($file.FullName)
+            try {
+                $length = [int][math]::Min(1MB, $stream.Length)
+                $null = $stream.Seek(-$length, [IO.SeekOrigin]::End)
+                $bytes = New-Object byte[] $length
+                $offset=0
+                while ($offset -lt $length) {
+                    $read=$stream.Read($bytes,$offset,$length-$offset)
+                    if ($read -eq 0) { break }
+                    $offset+=$read
+                }
+                [IO.File]::WriteAllBytes((Join-Path $destination $file.Name),$bytes)
+            }
+            finally { $stream.Dispose() }
+        }
+        Write-TaskEvent -Type 'diagnostics' -Data @{path=$destination}
+        Write-Log ('本次错误诊断已保存：{0}' -f $destination) 'WARN'
+        return $destination
+    }
+    catch { Write-Log ('错误诊断未能完整保存：{0}' -f $_.Exception.Message) 'WARN'; return '' }
+}
+
 function Assert-TaskNotCancelled {
     if ($CancelFile -and (Test-Path -LiteralPath $CancelFile -PathType Leaf)) {
         throw (New-Object OperationCanceledException('已取消本次任务。'))

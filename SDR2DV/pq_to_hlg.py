@@ -72,11 +72,14 @@ def convert(args):
     out=Path(args.output)
     if out.exists():
         raise FileExistsError(out)
+    from pipe_io import CHUNK_BYTES, write_frame
     dec=[args.ffmpeg,'-hide_banner','-v','error','-nostdin','-i',args.input,'-an',
-         '-pix_fmt','gbrp10le','-fps_mode','passthrough','-f','rawvideo','pipe:1']
+         '-pix_fmt','gbrp10le','-fps_mode','passthrough','-f','rawvideo',
+         '-blocksize',str(CHUNK_BYTES),'pipe:1']
     from truehdr_stream import HLG_TO_YUV, cache_encoding_args
     enc=[args.ffmpeg,'-hide_banner','-v','error','-nostdin','-n','-f','rawvideo',
-         '-pixel_format','gbrp16le','-video_size',f'{w}x{h}','-framerate',args.fps,'-i','pipe:0',
+         '-pixel_format','gbrp16le','-video_size',f'{w}x{h}','-framerate',args.fps,
+         '-blocksize',str(CHUNK_BYTES),'-i','pipe:0',
          '-an','-vf',HLG_TO_YUV] + cache_encoding_args(args.cache_encoder) + [
          '-color_primaries','bt2020','-color_trc','arib-std-b67','-colorspace','bt2020nc','-color_range','tv',str(out)]
     p=q=None
@@ -105,11 +108,13 @@ def convert(args):
                 code,limited=rgb_nits_to_hlg(cp,nits)
                 planes=cp.rint(cp.clip(code[[1,2,0]],0,1)*65535).astype(cp.uint16)
                 limited_count+=int(limited.sum().get())
-                q.stdin.write(cp.asnumpy(planes).astype('<u2',copy=False).tobytes())
+                write_frame(q.stdin,cp.asnumpy(planes).astype('<u2',copy=False),
+                            label='HLG cache',frame_number=count+1)
                 count+=1
                 if args.progress and count%15==0:
                     from fractions import Fraction
-                    Path(args.progress).write_text(f'frame={count}\nout_time_us={int(count/float(Fraction(args.fps))*1e6)}\n')
+                    from task_io import progress
+                    progress(args.progress,count,count/float(Fraction(args.fps)))
             q.stdin.close()
             if p.wait() or q.wait(): raise RuntimeError('PQ/HLG FFmpeg pipe failed; see logs')
         if count!=args.frames: raise RuntimeError(f'HLG frames {count} != PQ frames {args.frames}')

@@ -6,7 +6,7 @@ Windows 下将 SDR 转为 Dolby Vision 8.4 / HLG 或 8.1 / PQ，输出 MP4 / MKV
 ## 安装
 
 需要 Windows 10/11 x64、64 位 PowerShell 5.1 或 7，首次部署需要网络。
-克隆当前源码后运行部署；[旧 Release](https://github.com/gem0816-1/SDR2DV/releases/latest) 不一定包含本次尚未发布的 TUI。
+下载并解压 [Windows 发布包](https://github.com/gem0816-1/SDR2DV/releases/latest)，或克隆源码，然后运行部署。
 
 ```powershell
 .\deploy.bat
@@ -19,7 +19,7 @@ Windows 下将 SDR 转为 Dolby Vision 8.4 / HLG 或 8.1 / PQ，输出 MP4 / MKV
 ## 使用
 
 双击 `SDR2DV\TrueHDR-DV.bat`，或将 SDR 视频拖到它上面。
-方向键选择编码器、亮度映射、容器、码率和音频策略，检查摘要后确认开始。
+方向键选择编码器、亮度映射、容器、码率和音频策略；灰字解释各选项，Esc 返回，检查摘要后确认开始。
 转换中按 `L` 展开日志，`Ctrl+C` 请求安全取消本次任务。
 
 默认：DV 8.4、BT.2020 / HLG、Main10、1000 nit 参考峰值、Neutral、源码率匹配、Auto 优先 NVENC P6。
