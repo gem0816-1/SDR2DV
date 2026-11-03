@@ -17,7 +17,8 @@ import traceback
 
 import numpy as np
 from truehdr_backend import CREATE_FLAGS, consume, file_hash, read_frame, runtime, source_plan
-from pq_to_hlg import rgb_pq_to_nits, rgb_nits_to_hlg, cuda_reference_check
+from pq_to_hlg import (rgb_pq_to_nits, rgb_nits_to_hlg, cuda_reference_check,
+                      hlg_transport_format, hlg_transport_planes, pq_display_rgb)
 from brightness_mapping import luminance_lut, apply_mapping, mapping_info
 from stream_diagnostics import diagnostic_streams, log_tail
 from pipe_io import CHUNK_BYTES, FrameWriteError, write_frame
@@ -44,6 +45,7 @@ def required_remaining_bytes(cache_bytes, hdr10_bytes, completed, total):
 
 
 def encoder_command(args, width, height, fps, output, pq=False):
+    tone = mapping_info(args.tone_mapping,args.tone_strength,args.skin_strength)
     transfer = 'smpte2084' if pq else 'arib-std-b67'
     params = (f'lossless=1:repeat-headers=1:colorprim=bt2020:transfer={transfer}:'
               'colormatrix=bt2020nc:log-level=error')
@@ -56,7 +58,7 @@ def encoder_command(args, width, height, fps, output, pq=False):
         # Keep the optional PQ comparison's existing mastering-display SEI.
         encoding = ['-c:v','libx265','-preset','ultrafast','-x265-params',params]
     command = [args.ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-n',
-               '-f', 'rawvideo', '-pixel_format', 'gbrp16le',
+               '-f', 'rawvideo', '-pixel_format', 'gbrp16le' if pq else hlg_transport_format(tone),
                '-video_size', f'{width}x{height}', '-framerate', str(fps),
                '-blocksize', str(CHUNK_BYTES), '-i', 'pipe:0',
                '-an', '-vf', PQ_TO_YUV if pq else HLG_TO_YUV, '-fps_mode', 'passthrough'] + encoding + [
@@ -103,13 +105,15 @@ def convert(args):
     start = time.monotonic()
     tone = mapping_info(args.tone_mapping,args.tone_strength,args.skin_strength)
     report['brightness_mapping'] = tone
+    report['hlg_rgb_transport'] = hlg_transport_format(tone)
+    report['output_peak_policy'] = tone.get('peak_policy','1000nit_nominal_colour_volume')
     phase = 'source_timing'
     try:
         print('Checking decoded PTS and SDR colour interpretation...', file=sys.stderr, flush=True)
         video, fps, expected, input_filter = source_plan(args)
         phase = 'runtime_initialization'
         cp, nvvfx = runtime()
-        tone_lut = cp.asarray(luminance_lut()) if tone['name'] == 'reference' else None
+        tone_lut = cp.asarray(luminance_lut(name=tone['name'])) if tone['name'] in ('reference','realdolby') else None
         reference_error = cuda_reference_check(cp)
         width, height = video['width'], video['height']
         report.update(binding=nvvfx.__version__, sdk=nvvfx.get_sdk_version(),
@@ -162,13 +166,13 @@ def convert(args):
                     raise RuntimeError('Invalid TrueHDR RGB10A2 buffer')
                 rgb_pq = cp.stack([((packed >> shift) & 1023).astype(cp.float32)/1023 for shift in (0,10,20)])
                 display = apply_mapping(cp,rgb_pq_to_nits(cp,rgb_pq),tone,tone_lut)
-                hlg, limited = rgb_nits_to_hlg(cp,display)
-                planes = cp.rint(cp.clip(hlg[[1,2,0]],0,1)*65535).astype(cp.uint16)
+                hlg, limited = rgb_nits_to_hlg(cp,display,preserve_headroom=tone['name']=='realdolby')
+                planes = hlg_transport_planes(cp,hlg,tone)
                 limited_count += int(limited.sum().get())
-                write_frame(hlg_encoder.stdin,cp.asnumpy(planes).astype('<u2', copy=False),
+                write_frame(hlg_encoder.stdin,cp.asnumpy(planes).astype('<f4' if tone['name']=='realdolby' else '<u2', copy=False),
                             label='HLG cache',frame_number=count+1)
                 if pq_encoder:
-                    pq_display = display/cp.maximum(cp.max(display,axis=0)/1000,1)[None,...]
+                    pq_display = pq_display_rgb(cp,display,tone)
                     normalized = cp.maximum(pq_display,0)/10000
                     p = normalized ** cp.float32(2610/16384)
                     code = ((3424/4096+(2413/128)*p)/(1+(2392/128)*p)) ** cp.float32(2523/32)
@@ -260,7 +264,7 @@ if __name__ == '__main__':
     parser.add_argument('--saturation', type=int, default=100)
     parser.add_argument('--middle-gray', type=int, default=50)
     parser.add_argument('--debanding-off', action='store_true')
-    parser.add_argument('--tone-mapping',choices=['reference','neutral','natural'],default='neutral')
+    parser.add_argument('--tone-mapping',type=str.lower,choices=['reference','neutral','natural','realdolby'],default='neutral')
     parser.add_argument('--tone-strength',type=float,default=1.)
     parser.add_argument('--skin-strength',type=float)
     parser.add_argument('--cache-encoder',choices=['nvenc','x265'],default='nvenc')

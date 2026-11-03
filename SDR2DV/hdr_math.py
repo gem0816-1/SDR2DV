@@ -31,11 +31,11 @@ def hlg_eotf(code):
     return 1000 * scene * np.maximum(luminance(scene), 1e-30)[..., None] ** .2
 
 
-def display_to_hlg(rgb):
+def display_to_hlg(rgb, preserve_headroom=False):
     d = np.maximum(rgb, 0) / 1000
     scene = d * np.maximum(luminance(d), 1e-30)[..., None] ** (-1 / 6)
     # Uniform scaling in RGB retains chromaticity at the HLG colour-volume edge.
-    m = np.maximum(np.max(scene, axis=-1), 1)
+    m = np.ones(scene.shape[:-1]) if preserve_headroom else np.maximum(np.max(scene, axis=-1), 1)
     limited = scene / m[..., None]
     encoded = np.where(limited <= 1 / 12, np.sqrt(3 * limited),
                        A * np.log(np.maximum(12 * limited - B, 1e-30)) + C)

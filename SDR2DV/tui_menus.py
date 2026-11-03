@@ -24,7 +24,7 @@ def main_options(config):
     return [
         Option('start', '查看摘要并开始', '核对码率、音频、输出路径；再次确认后才会转换。'),
         Option('encoder', f'编码器 · {config.encoder}', '决定由显卡还是 CPU 压缩视频，影响速度和压缩效率。'),
-        Option('mapping', f'HDR 亮度映射 · {config.mapping}', '决定暗部、中间调和高光的分配；参考峰值固定 1000 nit。',
+        Option('mapping', f'HDR 亮度映射 · {config.mapping}', '决定明暗分配；realDolby 跟随苹果参考并保留超白，其他模式沿用 1000 nit 目标。',
                '仅 TrueHDR 模式使用' if config.hdr_mode != 'TrueHDR' else None),
         Option('container', f'输出容器 · {config.container.upper()}', 'MP4 用于投稿/播放；MKV 保留原音和字幕；可同时输出。'),
         Option('rate', f'码率策略 · {rates.get(config.bitrate_mode, config.bitrate_mode)}', '默认匹配源视频流；平台限码率需主动选择。'),
@@ -48,11 +48,11 @@ def advanced_options(config, caps):
                '正数越小通常文件越大；CQ 的 0 为自动。CQ 和 CRF 不可直接比较。',
                None if quality else '先选择“质量优先”并关闭无损；码率模式不使用此值'),
         Option('strength', f'亮度曲线强度 · {config.brightness_strength:g}',
-               '0 旁路额外调色；1 完整应用选定曲线；不会更改 1000 nit 目标。',
-               None if grading else '仅 TrueHDR 的 Natural / Reference 使用'),
+               '0 旁路额外调色；1 完整应用；realDolby 允许超过 1000 nit 的参考高光。',
+               None if grading else '仅 TrueHDR 的 Natural / Reference / realDolby 使用'),
         Option('skin', f'暖色肤色去黄 · {config.skin_strength:g}',
                '0 保留原色；越大去黄越强，也可能影响相近颜色的灯光。',
-               None if grading and config.brightness_strength > 0 else '需启用 Natural / Reference 且曲线强度大于 0'),
+               None if grading and config.brightness_strength > 0 else '需启用调色曲线且强度大于 0'),
         Option('lossless', '视频无损编码 · ' + ('开启' if config.lossless else '关闭'),
                '只保证最终编码不损失输入像素；SDR→HDR 调色全流程仍不是无损。'),
         Option('hdr10', 'HDR10/PQ 对照 · ' + ('开启' if config.hdr10 else '关闭'),
@@ -116,7 +116,7 @@ def configure_advanced(config, caps):
         elif action == 'strength':
             field = 'brightness_strength'
             value = number('曲线强度（0～1）', config.brightness_strength, 0, 1,
-                '0 关闭曲线和肤色修正；0.5 混合原始与映射效果；1 完整应用。参考峰值仍为 1000 nit。')
+                '0 关闭曲线和肤色修正；0.5 混合原始与映射效果；1 完整应用。realDolby 不按 1000 nit 限峰。')
         elif action == 'skin':
             field = 'skin_strength'
             value = number('暖色去黄强度（0～1）', config.skin_strength, 0, 1,
@@ -176,8 +176,9 @@ def configure(config, caps, description, summary, console):
         elif action == 'mapping':
             details = {'Neutral': '默认：保留 TrueHDR 的亮度和颜色，不叠加本工具的曲线或肤色修正。',
                        'Natural': '实验：保持中低亮度，柔和收住高光；仍需 HDR 设备观感确认。',
-                       'Reference': '旧参考风格，可能压暗阴影/提亮中间调；默认带 0.5 去黄，仅适合对照。'}
-            value = choose('HDR 亮度分配 · 1000 nit', [Option(name, name, detail,
+                       'Reference': '旧参考风格，可能压暗阴影/提亮中间调；默认带 0.5 去黄，仅适合对照。',
+                       'realDolby': '按配对苹果视频校准：收回偏亮的中低调、增强高光，保留 HLG 超白，不限 1000 nit；配对样片观感已获用户确认，其他素材建议先试片。'}
+            value = choose('HDR 亮度分配', [Option(name, name, detail,
                 None if name in caps['mappings'] else '后端未实现') for name, detail in details.items()], config.mapping)
             if value != BACK and value != config.mapping:
                 config.mapping = value; config.brightness_strength = defaults()['brightness_strength']

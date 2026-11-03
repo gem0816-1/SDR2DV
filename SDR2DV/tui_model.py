@@ -81,7 +81,7 @@ class ConversionConfig:
     def validate(self,capabilities,media=None,require_path=True,description=None):
         self.validate_types()
         if require_path and not Path(normalize_path(self.input_path)).exists():raise ValueError('输入路径不存在')
-        if self.profile!='8.4':raise ValueError('TUI 固定 Dolby Vision 8.4 / HLG / 1000 nit；其他流程使用 PowerShell CLI')
+        if self.profile!='8.4':raise ValueError('TUI 固定 Dolby Vision 8.4 / HLG；其他流程使用 PowerShell CLI')
         if self.encoder not in ('Auto','NVENC','x265'):raise ValueError('未知编码器')
         available=nvenc_available(capabilities,self.hdr_mode,self.lossless)
         if self.encoder=='NVENC' and not available:raise ValueError('当前硬件/驱动不支持本模式所需 NVENC Main10 / 无损缓存')
@@ -142,7 +142,7 @@ def planned_outputs(config):
     folder = Path(normalize_path(config.output_dir)) if config.output_dir else source.parent
     tone = ''
     if config.hdr_mode == 'TrueHDR' and config.brightness_strength > 0:
-        tone = {'Reference': '_Ref', 'Natural': '_Natural'}.get(config.mapping, '')
+        tone = {'Reference': '_Ref', 'Natural': '_Natural', 'realDolby': '_realDolby'}.get(config.mapping, '')
     prefix = source.stem + ('_TrueHDR' + tone if config.hdr_mode == 'TrueHDR' else '')
     extensions = ('mp4', 'mkv') if config.container == 'both' else (config.container,)
     paths = [folder / (prefix + '_DV' + config.profile.replace('.', '') + '.' + ext) for ext in extensions]

@@ -49,7 +49,8 @@ def summary(config,caps,description):
                 'Custom':f'自定义 {config.video_bitrate/1000:.3f} Mbps','Quality':'无损编码' if config.lossless else f'质量优先 · CQ {config.nvenc_cq}' if chosen=='NVENC' else f'质量优先 · CRF {config.crf}'}
     table=Table.grid(padding=(0,2));table.add_column(style='dim',no_wrap=True);table.add_column(overflow='fold')
     values=[('输入',config.input_path),('处理',config.hdr_mode),('编码',f'{config.encoder} → {chosen} · '+(config.nvenc_preset if chosen=='NVENC' else config.preset)),
-        ('HDR','Dolby Vision 8.4 · BT.2020 / HLG · Main10 · 1000 nit'),
+        ('HDR','Dolby Vision 8.4 · BT.2020 / HLG · Main10 · '+
+            ('跟随苹果参考，保留超白，不限 1000 nit' if config.mapping=='realDolby' and config.brightness_strength>0 and config.hdr_mode=='TrueHDR' else '1000 nit 目标')),
         ('亮度映射',mapping_label(config)),
         ('码率',strategies[config.bitrate_mode]),('音频','MKV：全部音轨原样复制' if config.container=='mkv' else {'auto':'兼容性优先：可复制则复制，PCM → 经采样校验的 ALAC','copy':'强制复制（PCM MP4 兼容性待验证）','alac':'显式 ALAC 无损转换'}[config.audio_codec]),
         ('输出',config.container.upper()+(' + HDR10/PQ 对照' if config.hdr10 else '')),('输出目录',config.output_dir or '与输入相同'),
@@ -74,6 +75,8 @@ def summary(config,caps,description):
         console.print('[dim]NVENC 按平均码率目标分配；简单画面/短片可能用不满预算，完成后显示实际偏差。[/dim]')
     if config.hdr_mode=='TrueHDR' and config.mapping=='Natural' and config.brightness_strength>0:
         console.print('[yellow]Natural 数值与转换测试已实现；HDR 设备观感仍待确认。默认保留 Neutral。[/yellow]')
+    if config.hdr_mode=='TrueHDR' and config.mapping=='realDolby' and config.brightness_strength>0:
+        console.print('[dim]realDolby 按配对参考校准并保留扩展 HLG；1000 nit 仅为测量参考。配对样片观感已获用户确认；其他素材建议先试片，创作 Trim 与丢失细节不能直接复制。[/dim]')
     console.print('[dim]SDR 高光缺失无法真实恢复；同码率不等于无损。B站 DV / Hi-Res 仍需投稿实测。[/dim]')
 
 
@@ -152,7 +155,7 @@ def main(argv=None):
         config=ConversionConfig.from_dict(json.loads(Path(args.config).read_text(encoding='utf-8-sig'))) if args.config else ConversionConfig.initial()
         console.print(Text('SDR2DV  /  SDR → Dolby Vision',style='bold cyan'))
         console.print(Text(f'程序位置：{backend.root}',style='dim'))
-        console.print('[dim]1000 nit · 默认匹配源视频流 · 灰字解释各选项 · Esc 返回，Ctrl+C 退出[/dim]')
+        console.print('[dim]默认 1000 nit；realDolby 跟随参考 · 匹配源视频流 · Esc 返回，Ctrl+C 退出[/dim]')
         if args.input:config.input_path=normalize_path(args.input)
         if not config.input_path:
             if not sys.stdin.isatty():raise ValueError('非交互运行请提供输入路径，并使用 PowerShell CLI；--dry-run 仅校验参数')

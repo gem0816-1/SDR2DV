@@ -29,7 +29,7 @@
     8.1：PQ / HDR10 兼容基础层；8.4：HLG 兼容基础层。
 
 .PARAMETER Bilibili
-    B站投稿预设：Profile 8.4、HLG、1000 nit。默认匹配源视频流码率；Platform 模式才限制平台兼容码率。
+    B站投稿预设：Profile 8.4、HLG，默认1000 nit目标；realDolby保留参考超白。默认匹配源视频流码率；Platform 模式才限制平台兼容码率。
 
 .PARAMETER PeakNits
     1000：扩展最亮一段，中低亮度保持 WhitePoint 基准；0：关闭高光扩展。
@@ -38,13 +38,13 @@
     Original 保留原转换；TrueHDR 使用官方 NVIDIA SDK，固定输出 P8.4，不叠加原高光曲线。
 
 .PARAMETER BrightnessMapping
-    Neutral 默认保留 SDK 直接映射；Natural 实验模式保护中低亮度并平滑收肩；Reference 保留旧参考曲线。
+    Neutral 默认保留 SDK 直接映射；Natural 保护中低亮度；Reference 旧曲线；realDolby 按配对苹果参考校准，允许 HLG 超白，不以 1000 nit 截顶。
 
 .PARAMETER BrightnessStrength
-    Natural / Reference 曲线强度，0..1，默认 1；0 相当于 Neutral。
+    Natural / Reference / realDolby 曲线强度，0..1，默认 1；0 相当于 Neutral。
 
 .PARAMETER SkinToneCorrection
-    暖色肤色去黄强度，0..1；Neutral/Natural 默认 0，显式 Reference 默认 0.5。
+    暖色肤色去黄强度，0..1；Neutral/Natural/realDolby 默认 0，显式 Reference 默认 0.5。
 
 .PARAMETER KeepHDR10
     TrueHDR 模式额外保留独立 HDR10/PQ MP4，音轨遵循 Mp4AudioCodec 策略。
@@ -138,7 +138,7 @@ param(
 
     [switch]$TrueHDRDebandingOff,
 
-    [ValidateSet('Reference', 'Neutral', 'Natural')]
+    [ValidateSet('Reference', 'Neutral', 'Natural', 'realDolby')]
     [string]$BrightnessMapping = 'Neutral',
 
     [ValidateRange(0.0, 1.0)]
@@ -225,7 +225,7 @@ param(
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
-$script:ScriptVersion = '2.0.0'
+$script:ScriptVersion = '2.1.0'
 . (Join-Path $PSScriptRoot 'encoding.ps1')
 . (Join-Path $PSScriptRoot 'core.ps1')
 $script:Defaults = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'defaults.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -1001,6 +1001,7 @@ function Convert-SingleFile {
     if ($HdrMode -eq 'TrueHDR') {
         if ($BrightnessMapping -eq 'Reference' -and $BrightnessStrength -gt 0) { $suffix = '_Ref' + $suffix }
         elseif ($BrightnessMapping -eq 'Natural' -and $BrightnessStrength -gt 0) { $suffix = '_Natural' + $suffix }
+        elseif ($BrightnessMapping -eq 'realDolby' -and $BrightnessStrength -gt 0) { $suffix = '_realDolby' + $suffix }
         $suffix = '_TrueHDR' + $suffix
     }
     if ($Format -eq 'mp4' -or $Format -eq 'both') {
@@ -1108,6 +1109,7 @@ function Convert-SingleFile {
             $hdr10Suffix = '_TrueHDR_HDR10.mp4'
             if ($toneName -eq 'reference') { $hdr10Suffix = '_TrueHDR_Ref_HDR10.mp4' }
             elseif ($toneName -eq 'natural') { $hdr10Suffix = '_TrueHDR_Natural_HDR10.mp4' }
+            elseif ($toneName -eq 'realdolby') { $hdr10Suffix = '_TrueHDR_realDolby_HDR10.mp4' }
             if ($toneName -ne 'neutral') {
                 $mappingText = & $script:TrueHDRPython -B (Join-Path $PSScriptRoot 'brightness_mapping.py') --describe --mode $toneName --strength $toneStrength --skin-strength $skinStrength
                 if ($LASTEXITCODE -ne 0) { throw '无法读取参考亮度曲线配置。' }
@@ -1177,8 +1179,22 @@ function Convert-SingleFile {
             $encodeSource = $hlgSource
             $encodeZscale = 'null'
             if ($applyCachedBrightness) {
-                Write-Log '复用旧的中性 HLG 缓存；在编码时应用参考亮度曲线，不重跑 AI。'
-                $encodeZscale = New-ReferenceBrightnessFilter -WorkDir $workDir -Transfer hlg
+                if ($toneName -eq 'realdolby') {
+                    Write-Log '复用中性 HLG 缓存；以浮点流式调色保留超白，不重跑 AI。已在旧缓存中丢失的高光无法撤销。'
+                    $gradedCache = Join-Path $workDir 'realdolby_hlg.mkv'
+                    $gradeArgs = @('--input', $hlgSource, '--input-transfer', 'hlg', '--output', $gradedCache,
+                        '--report', (Join-Path $workDir 'realdolby-cache-report.json'), '--fps', $info.FpsText,
+                        '--frames', [string]$cacheInfo.frames, '--ffmpeg', $script:Ffmpeg, '--ffprobe', $script:Ffprobe,
+                        '--tone-mapping', $toneName, '--tone-strength', $toneStrength, '--skin-strength', $skinStrength,
+                        '--cache-encoder', $Encoder.ToLowerInvariant())
+                    Invoke-MediaWithProgress -Exe $script:TrueHDRPython -ArgumentPrefix @('-B', (Join-Path $PSScriptRoot 'pq_to_hlg.py')) `
+                        -Arguments $gradeArgs -WorkDir $workDir -LogBaseName 'realdolby_cache' -What 'realDolby 缓存调色' -Label 'realDolby' -TotalSeconds $info.Duration -ProcessWorkingDirectory $tempRoot
+                    $encodeSource = $gradedCache
+                }
+                else {
+                    Write-Log '复用旧的中性 HLG 缓存；在编码时应用参考亮度曲线，不重跑 AI。'
+                    $encodeZscale = New-ReferenceBrightnessFilter -WorkDir $workDir -Transfer hlg
+                }
             }
             if ($toneName -eq 'reference') {
                 Write-Log ('参考亮度曲线（强度 {0}）：保留黑位、扩展中高亮、1000 nit 高光柔和收拢；全片固定曲线。' -f $toneStrength)
@@ -1186,7 +1202,11 @@ function Convert-SingleFile {
                     Write-Log ('暖色肤色去黄（强度 {0}）：轻微减绿、补蓝并保持亮度；按颜色范围选择。' -f $skinStrength)
                 }
             }
-            Write-Log 'PQ→HLG：1000 nit / gamma 1.2 / 理想黑；亮度相关 OOTF，超出 HLG 色体积时等比限制 RGB。'
+            if ($toneName -eq 'realdolby') {
+                Write-Log 'realDolby：配对苹果参考固定曲线；浮点 HLG 保留超白，不按 1000 nit 限峰，不自动修改饱和度或肤色。'
+                Write-Log '1000 nit / gamma 1.2 仅为 HLG 测量参考；实际峰值与 RPU 由最终像素分析，不复制参考片的 Trim。'
+            }
+            else { Write-Log 'PQ→HLG：1000 nit / gamma 1.2 / 理想黑；亮度相关 OOTF，超出 HLG 色体积时等比限制 RGB。' }
             Write-Log 'TrueHDR 不叠加原模式高光曲线；最终基础层将逐帧统计并生成镜头级社区分析 RPU。'
             if ($KeepHDR10) {
                 $hdr10Target = Join-Path $targetDir ($baseName + $hdr10Suffix)
@@ -1317,6 +1337,8 @@ function Convert-SingleFile {
         elseif ($frameCount -ne $info.SourceFrameCount) { throw '输出帧数与原始解码帧数不一致。' }
         $stats=@{MaxNits=$analysis.max_cll_nits;AvgNits=$analysis.max_fall_nits}
         $fileReport.hdr=@{max_cll_nits=$analysis.max_cll_nits;max_fall_nits=$analysis.max_fall_nits;
+            brightness_mapping=$BrightnessMapping;brightness_strength=$BrightnessStrength;hlg_display_reference_nits=1000;
+            reference_headroom=($HdrMode -eq 'TrueHDR' -and $BrightnessMapping -eq 'realDolby' -and $BrightnessStrength -gt 0);
             max_cie_y_nits=$analysis.max_cie_y_nits;mean_y_nits=$analysis.mean_y_nits;
             max_frame_fraction_maxrgb_gt1000=$analysis.max_frame_fraction_maxrgb_gt1000;
             max_frame_fraction_y_gt1100=$analysis.max_frame_fraction_y_gt1100;
@@ -1488,7 +1510,7 @@ try {
         if (-not $PSBoundParameters.ContainsKey('PeakNits')) { $PeakNits = 1000 }
     }
     if ($HdrMode -eq 'TrueHDR') {
-        if ($TrueHDRLuminance -ne 1000) { throw '此 SDR→DV8.4 流程固定 1000 nit 参考峰值；不以降低峰值代替正确映射。' }
+        if ($TrueHDRLuminance -ne 1000) { throw '当前曲线以 SDK 1000 nit 基准校准；realDolby 的最终调色允许参考超白，不以此值限制成片峰值。' }
         if ($PSBoundParameters.ContainsKey('Profile') -and $Profile -ne '8.4') { throw 'TrueHDR 模式要求 -Profile 8.4。' }
         if ($PSBoundParameters.ContainsKey('PeakNits') -and $PeakNits -ne 0) { throw 'TrueHDR 不能叠加 -PeakNits 高光曲线；请用 -TrueHDRLuminance。' }
         if ($PSBoundParameters.ContainsKey('WhitePoint')) { throw 'TrueHDR 不使用 -WhitePoint；请用 -TrueHDRMiddleGray。' }
@@ -1519,7 +1541,10 @@ try {
         $script:OutputTransfer = 'arib-std-b67'
     }
     if ($HdrMode -eq 'TrueHDR') {
-        Write-Log ('目标 Profile 8.4 / HLG，NVIDIA TrueHDR 目标 {0} nit（HLG 参考显示 1000 nit）' -f $TrueHDRLuminance)
+        if ($BrightnessMapping -eq 'realDolby' -and $BrightnessStrength -gt 0) {
+            Write-Log '目标 Profile 8.4 / HLG，realDolby 跟随苹果参考亮度，允许超白；SDK 基准与 HLG 测量参考为 1000 nit，不限制成片峰值。'
+        }
+        else { Write-Log ('目标 Profile 8.4 / HLG，NVIDIA TrueHDR 目标 {0} nit（HLG 参考显示 1000 nit）' -f $TrueHDRLuminance) }
     }
     else { Write-Log ('目标 Profile {0} / {1}，SDR 白点映射至 {2} nit' -f $Profile, $script:OutputTransfer, $WhitePoint) }
 

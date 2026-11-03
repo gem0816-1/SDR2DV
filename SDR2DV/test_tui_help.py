@@ -117,5 +117,23 @@ class ExplainedMenuTests(unittest.TestCase):
         compact=''.join(rendered.split()).replace('│','')
         self.assertIn('中文测试电影_TrueHDR_DV84.mp4',compact)
 
+    def test_real_dolby_selection_help_arguments_paths_and_peak_summary(self):
+        config=ConversionConfig.initial('中文 测试.mov')
+        with patch('tui_menus.choose',side_effect=['mapping','realDolby','exit']):
+            with self.assertRaises(KeyboardInterrupt):configure(config,CAPS,{},None,Console(file=StringIO()))
+        config.validate(CAPS,require_path=False)
+        self.assertEqual(config.skin_strength,0)
+        self.assertIn('realDolby',config.backend_args(CAPS))
+        config.container='both';config.hdr10=True
+        self.assertEqual([p.name for p in planned_outputs(config)],['中文 测试_TrueHDR_realDolby_DV84.mp4',
+            '中文 测试_TrueHDR_realDolby_DV84.mkv','中文 测试_TrueHDR_realDolby_HDR10.mp4'])
+        from tui import summary
+        buffer=StringIO()
+        with patch('tui.console',Console(file=buffer,width=140)):
+            summary(config,CAPS,{'video_bitrate':{'bps':31337771},'media':{'format':{'duration':'223.05'}}})
+        self.assertIn('不限 1000 nit',buffer.getvalue())
+        with self.assertRaisesRegex(ValueError,'后端尚未实现'):
+            config.validate({**CAPS,'mappings':['Neutral']},require_path=False)
+
 
 if __name__=='__main__':unittest.main()

@@ -32,7 +32,7 @@
 | 参数 | 默认 / 说明 |
 | --- | --- |
 | `-HdrMode` / `-Profile` | CLI 为 Original / 8.1；TUI 为 TrueHDR / 8.4 |
-| `-Bilibili` | 固定8.4、HLG、1000 nit；不强制28/30 Mbps |
+| `-Bilibili` | 固定8.4、HLG；默认1000 nit目标，realDolby保留参考超白；不强制28/30 Mbps |
 | `-Encoder` | Auto，8.4 优先实测可用 NVENC，否则 x265 |
 | `-NvencPreset` / `-Preset` | p6 / medium |
 | `-BitrateMode` | Source；可选 Platform / Custom / Quality |
@@ -40,9 +40,9 @@
 | `-MaxVideoBitrate` | Source/Custom 默认目标的1.5倍 VBV；显式值不得低于目标 |
 | `-Crf` / `-NvencCq` | 显式指定选择 Quality；分别用于 x265 / NVENC |
 | `-Lossless` | 编码器视频无损模式，需 Quality，不代表 SDR→HDR 全流程无损 |
-| `-BrightnessMapping` | Neutral；Natural 实验；Reference 旧创作预设 |
+| `-BrightnessMapping` | Neutral；Natural 实验；Reference 旧创作预设；realDolby 配对苹果参考曲线 |
 | `-BrightnessStrength` | 1，0..1，0旁路曲线 |
-| `-SkinToneCorrection` | Neutral/Natural 为0；显式 Reference 未指定时沿用0.5 |
+| `-SkinToneCorrection` | Neutral/Natural/realDolby 为0；显式 Reference 未指定时沿用0.5 |
 | `-KeepHDR10` | TrueHDR 额外输出同次推理的 PQ 对照，x265无损缓存，保留1000nit MDCV |
 | `-Mp4AudioCodec` | auto；copy / alac；普通模式保留显式 ac3/eac3 有损选项 |
 | `-Format` | mp4 / mkv / both；MKV 始终原音复制 |
@@ -64,8 +64,9 @@ NVENC 为 VBR + HQ / fullres 逐帧多遍、lookahead20、空间/时间AQ；不�
 
 ## 亮度与精度
 
-TrueHDR SDK 输出RGB10A2/PQ；使用ST2084绝对EOTF，float32线性BT.2020调色，再以BT.2100 HLG逆OOTF/OETF转换至GBR16，最后一次4:2:0/10bit量化。
-HLG参考显示1000 nit、理想黑、gamma1.2；75% HLG信号约203 nit。超出HLG色体积的RGB等比缩限；不做自动全片曝光/饱和度提升。
+TrueHDR SDK 输出RGB10A2/PQ；使用ST2084绝对EOTF，float32线性BT.2020调色，再以BT.2100 HLG逆OOTF/OETF转换，最后一次4:2:0/10bit量化。
+HLG测量参考为1000 nit、理想黑、gamma1.2；75% HLG信号约203 nit。Neutral/Natural/Reference 沿用GBR16及名义HLG色体积等比缩限；不做自动全片曝光/饱和度提升。
+`realDolby` 使用GBR float32管道，允许参考片实际存在的扩展HLG信号，不在RGB/HLG/PQ中截到1000 nit；1000仅为SDK校准基准和测量参考，不是本模式成片峰值限制。详见[配对校准说明](realDolby.md)。
 Natural 在0..600 nit保持亮度恒等（含暗部/中间调/漫反射白），600..1000采用C1连续单调多项式，以上指数软肩渐近1000；默认不修肤色。
 这是中性起点上的高光分配，不是对所有镜头强拉到1000 nit。Reference 是历史创作预设，可能压暗阴影/抬高中间调，仅保留对照。
 AI结果是推断，不是SDR剪切区域真实细节的证明。Natural通过数值/管线检查后仍需HDR显示观感和舞台灯光实测，故默认Neutral。

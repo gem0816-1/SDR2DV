@@ -12,7 +12,7 @@ from tui_model import ConversionConfig,defaults,encoder_options,normalize_path
 from tui_runner import Backend,ConversionTask
 
 CAPS=dict(nvenc_ready=True,x265_ready=True,truehdr_ready=True,muxer_ready=True,
-          mappings=['Neutral','Natural','Reference'],bitrate_modes=['Source','Platform','Custom','Quality'])
+          mappings=['Neutral','Natural','Reference','realDolby'],bitrate_modes=['Source','Platform','Custom','Quality'])
 
 
 class TUIModelTests(unittest.TestCase):

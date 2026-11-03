@@ -138,7 +138,10 @@ function Get-FinalHdrAnalysis {
     if ($analysis.compatibility_clamped_shots -gt 0) {
         Write-Log ('{0} 个镜头的编码 L1 受 dovi_tool CMv4 兼容范围约束；原始测量与编码值分别记录。未生成创作性 Trim。' -f $analysis.compatibility_clamped_shots) 'WARN'
     }
-    if ($analysis.max_cll_nits -gt 1010) { Write-Log ('最终重建像素 MaxRGB 峰值 {0:0.0} nit 超过 1000 nit 参考目标；如实记录超调，不将目标元数据冒充像素测量。' -f $analysis.max_cll_nits) 'WARN' }
+    if ($HdrMode -eq 'TrueHDR' -and $BrightnessMapping -eq 'realDolby' -and $BrightnessStrength -gt 0) {
+        Write-Log ('realDolby 允许参考超白；最终像素 MaxRGB {0:0.0} nit / CIE Y {1:0.0} nit（1000 nit HLG 测量参考），不把参考值当成输出峰值。' -f $analysis.max_cll_nits, $analysis.max_cie_y_nits)
+    }
+    elseif ($analysis.max_cll_nits -gt 1010) { Write-Log ('最终重建像素 MaxRGB 峰值 {0:0.0} nit 超过 1000 nit 参考目标；如实记录超调，不将目标元数据冒充像素测量。' -f $analysis.max_cll_nits) 'WARN' }
     return $analysis
 }
 
@@ -176,6 +179,7 @@ function Get-CoreCapabilities {
         truehdr_ready=$ready; truehdr_error=$sdkError; truehdr_python=$sdkPython;
         nvenc_ready=$nvenc.Ready; nvenc_error=$nvenc.Error; x265_ready=$x265;
         nvenc_lossless_ready=$nvencLossless.Ready; nvenc_lossless_error=$nvencLossless.Error;
-        mappings=@('Neutral','Natural','Reference'); natural_status=$script:Defaults.natural_status;
+        mappings=@('Neutral','Natural','Reference','realDolby'); natural_status=$script:Defaults.natural_status;
+        realdolby_status='paired_reference_user_visual_accepted';
         bitrate_modes=@('Source','Platform','Custom','Quality'); profiles=@('8.4'); peak_nits=1000 }
 }

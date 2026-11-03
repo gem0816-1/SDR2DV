@@ -1,4 +1,4 @@
-"""Fixed display-light grading calibrated against a 1000-nit HLG reference.
+"""Fixed display-light grading, including a paired Apple HLG reference preset.
 
 This is a creative brightness preset, not reconstruction of an unavailable SDR
 master. A single monotone curve is used throughout the video: no frame-wise
@@ -25,20 +25,35 @@ ANCHORS = np.array([
 PROFILE_SHA256 = hashlib.sha256(PROFILE_ID.encode()+b':warm-skin-v1:'+ANCHORS.astype('<f8').tobytes()).hexdigest()
 NATURAL_ID = 'natural1000-v1'
 NATURAL_SHA256 = hashlib.sha256(b'natural1000-v1:identity<=600;hermite600-980;exp-tail400;no-auto-skin').hexdigest()
+REAL_DOLBY_ID = 'realDolby-v1'
+# Paired SDR/Apple HLG pixels, not metadata copied from another master. HLG is
+# measured at the BT.2100 1000-nit/gamma1.2 reference; that is NOT a peak cap.
+REAL_DOLBY_ANCHORS = np.array([
+    [0,0], [.005,.015], [.02,.06], [.1,.16], [.25,.30], [.5,.4], [1,.55], [2,.97],
+    [5,2.2], [10,4.8], [20,10.5], [40,25], [80,64], [120,106],
+    [180,173], [260,258], [400,400], [500,520], [560,800], [640,860],
+    [780,930], [900,1400], [1000,1750], [1500,2050], [3000,2150], [10000,2200],
+], dtype=np.float64)
+REAL_DOLBY_SHA256 = hashlib.sha256(REAL_DOLBY_ID.encode() +
+    b':extended-hlg-float32:no-auto-skin:' + REAL_DOLBY_ANCHORS.astype('<f8').tobytes()).hexdigest()
 
 
 def mapping_info(name='reference', strength=1.0, skin_strength=None):
     name = name.lower()
     strength = float(strength)
     skin_strength = float((.5 if name=='reference' else 0) if skin_strength is None else skin_strength)
-    if (name not in ('reference', 'neutral', 'natural') or not np.isfinite(strength) or not 0 <= strength <= 1 or
+    if (name not in ('reference', 'neutral', 'natural', 'realdolby') or not np.isfinite(strength) or not 0 <= strength <= 1 or
             not np.isfinite(skin_strength) or not 0 <= skin_strength <= 1):
-        raise ValueError('Brightness mapping must be reference/neutral with strength 0..1')
+        raise ValueError('Brightness mapping must be reference/neutral/natural/realDolby with strength 0..1')
     if name == 'neutral' or strength == 0:
         return dict(name='neutral', strength=0., skin_strength=0., profile_id=None, profile_sha256=None)
     if name == 'natural':
         return dict(name=name,strength=strength,skin_strength=skin_strength,
                     profile_id=NATURAL_ID,profile_sha256=NATURAL_SHA256)
+    if name == 'realdolby':
+        return dict(name=name, strength=strength, skin_strength=skin_strength,
+                    profile_id=REAL_DOLBY_ID, profile_sha256=REAL_DOLBY_SHA256,
+                    hlg_signal_range='extended', peak_policy='reference_no_1000nit_cap')
     return dict(name=name, strength=strength, skin_strength=skin_strength, profile_id=PROFILE_ID, profile_sha256=PROFILE_SHA256)
 
 
@@ -76,15 +91,19 @@ def natural_luminance(xp, nits):
 
 
 def luminance_lut(size=4096, name='reference'):
+    name = name.lower()
     if name == 'natural':
         result = natural_luminance(np,pq_eotf(np.linspace(0,1,size)))
         result[0] = 0
         return result.astype(np.float32)
-    x, y = pq_encode(ANCHORS[:,0]), pq_encode(ANCHORS[:,1])
+    if name not in ('reference','realdolby'):
+        raise ValueError('No luminance LUT for '+name)
+    anchors = REAL_DOLBY_ANCHORS if name == 'realdolby' else ANCHORS
+    x, y = pq_encode(anchors[:,0]), pq_encode(anchors[:,1])
     x[0] = y[0] = 0.
     result = pq_eotf(_monotone_cubic(x,y,np.linspace(0,1,size)))
     result[0] = 0.
-    return np.clip(result,0,1000).astype(np.float32)
+    return np.clip(result,0,anchors[-1,1]).astype(np.float32)
 
 
 def map_display_rgb(xp, rgb, table, strength=1.0):
@@ -107,6 +126,8 @@ def map_display_rgb(xp, rgb, table, strength=1.0):
 
 
 def apply_mapping(xp,rgb,tone,table=None):
+    if tone['name']=='realdolby' and table is None:
+        raise ValueError('realDolby requires its calibrated luminance LUT')
     if tone['name']=='natural':
         y=xp.maximum(.2627*rgb[0]+.6780*rgb[1]+.0593*rgb[2],0)
         target=y+(natural_luminance(xp,y)-y)*tone['strength']
@@ -152,12 +173,13 @@ def correct_warm_skin(xp, rgb, strength=.5):
 def map_encoded_rgb(rgb, transfer='hlg', strength=1.0, skin_strength=None, mapping='reference'):
     """CPU reference, channel-last RGB; used for LUT export and verification."""
     tone = mapping_info(mapping,strength,skin_strength)
-    display = hlg_eotf(np.clip(rgb,0,1)) if transfer == 'hlg' else pq_eotf(np.clip(rgb,0,1))
+    extended = tone['name'] == 'realdolby'
+    display = hlg_eotf(np.maximum(rgb,0) if extended else np.clip(rgb,0,1)) if transfer == 'hlg' else pq_eotf(np.clip(rgb,0,1))
     table = luminance_lut(name=tone['name']) if tone['name']!='neutral' else None
     mapped = np.moveaxis(apply_mapping(np,np.moveaxis(display,-1,0),tone,table),0,-1)
     if transfer == 'hlg':
-        return display_to_hlg(mapped)[0]
-    mapped = mapped/np.maximum(np.max(mapped,axis=-1)/1000,1)[...,None]
+        return display_to_hlg(mapped,preserve_headroom=extended)[0]
+    mapped = mapped/np.maximum(np.max(mapped,axis=-1)/(10000 if extended else 1000),1)[...,None]
     return np.clip(pq_encode(mapped),0,1)
 
 
@@ -165,6 +187,8 @@ def write_cube(path, transfer='hlg', strength=1., size=129, skin_strength=None, 
     if size < 2 or size > 256:
         raise ValueError('Cube size must be 2..256')
     tone=mapping_info(mapping,strength,skin_strength)
+    if tone['name']=='realdolby' and transfer=='hlg':
+        raise ValueError('realDolby HLG requires the float32 streaming adapter; a nominal-range cube would clip super-whites')
     axis = np.linspace(0,1,size)
     red, green = np.meshgrid(axis,axis)
     with Path(path).open('x',encoding='ascii',newline='\n') as output:
@@ -183,7 +207,7 @@ if __name__ == '__main__':
     parser.add_argument('--strength',type=float,default=1.)
     parser.add_argument('--size',type=int,default=129)
     parser.add_argument('--skin-strength',type=float)
-    parser.add_argument('--mode',choices=['natural','neutral','reference'],default='reference')
+    parser.add_argument('--mode',type=str.lower,choices=['natural','neutral','reference','realdolby'],default='reference')
     args = parser.parse_args()
     info = mapping_info(args.mode,args.strength,args.skin_strength)
     if args.describe:
