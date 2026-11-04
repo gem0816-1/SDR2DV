@@ -10,9 +10,9 @@ try {
         & $Python -X utf8 -m venv (Join-Path $PSScriptRoot '.venv-tui')
         if ($LASTEXITCODE -ne 0) { throw 'Could not create project-local TUI environment.' }
     }
-    $probe="import importlib.metadata as m,sys; v={'rich':'15.0.0','questionary':'2.1.1','numpy':'2.4.6'}; sys.exit(0 if all(m.version(k)==n for k,n in v.items()) else 1)"
+    $probe="import importlib.metadata as m,sys; from pathlib import Path; p=Path(sys.argv[1]); v=dict(x.strip().split('==') for x in p.read_text().splitlines() if x.strip() and not x.startswith('#')); v.update({'rich':'15.0.0','questionary':'2.1.1','numpy':'2.4.6'}); sys.exit(0 if all(m.version(k)==n for k,n in v.items()) else 1)"
     $old=$ErrorActionPreference
-    try { $ErrorActionPreference='Continue'; $null=& $localPython -X utf8 -B -c $probe 2>&1; $ready=($LASTEXITCODE -eq 0) }
+    try { $ErrorActionPreference='Continue'; $null=& $localPython -X utf8 -B -c $probe (Join-Path $PSScriptRoot 'tui-constraints.txt') 2>&1; $ready=($LASTEXITCODE -eq 0) }
     finally { $ErrorActionPreference=$old }
     if (-not $ready) {
         if ($CheckOnly) { throw 'Pinned TUI/core dependencies missing. Run deploy.bat.' }

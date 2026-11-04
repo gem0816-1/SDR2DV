@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from truehdr_stream import required_remaining_bytes
 from truehdr_backend import verify_cache, file_hash
@@ -30,7 +31,7 @@ class StorageTests(unittest.TestCase):
                           parameters=params,input_sha256=file_hash(source),hlg_file_sha256=file_hash(cache),
                           frames=30,sdk='test-manifest')
             (root/'truehdr-report.json').write_text(json.dumps(manifest))
-            result=verify_cache(args)
+            with patch('cache_binding.media_tags',return_value={}):result=verify_cache(args)
             self.assertTrue(result['verified'])
             self.assertEqual(result['hlg'],str(cache))
             cache.write_bytes(b'tampered')

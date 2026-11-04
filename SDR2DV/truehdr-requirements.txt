@@ -1,2 +1,3 @@
+-c truehdr-constraints.txt
 numpy==2.4.6
 cupy-cuda12x[ctk]==14.2.0

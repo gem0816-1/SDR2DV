@@ -5,6 +5,7 @@ and not BT.2020 CIE Y. CIE Y diagnostics are reported separately. This is
 not Dolby's proprietary/certified analysis and creates no creative trims.
 """
 import argparse
+from contextlib import nullcontext
 from fractions import Fraction
 import json
 import os
@@ -53,6 +54,7 @@ def frame_statistics(xp,rgb):
     scalars=xp.stack((maximum.max(),maximum.mean(),y.max(),y.mean(),pq.min(),pq.max(),pq.mean(),
         xp.count_nonzero(maximum>1000),xp.count_nonzero(y>1000),xp.count_nonzero(maximum>1100),xp.count_nonzero(y>1100)))
     values=np.asarray(scalars) if xp is np else xp.asnumpy(scalars)
+    if not np.isfinite(values).all():raise ValueError('Non-finite decoded HDR statistics')
     step_y=max(1,rgb.shape[1]//36);step_x=max(1,rgb.shape[2]//64)
     thumbnail=pq_code(xp,rgb[:,::step_y,::step_x])
     thumbnail=np.asarray(thumbnail) if xp is np else xp.asnumpy(thumbnail)
@@ -131,9 +133,63 @@ def make_shots(frames,cuts):
     return shots
 
 
+class ShotSummary:
+    """Same ordered sums and rounding as make_shots, without retaining frames."""
+    def __init__(self,start):
+        self.start=start;self.count=0;self.low=float('inf');self.high=0.;self.total=0.
+
+    def add(self,stats):
+        self.count+=1;self.low=min(self.low,stats['min_pq']);self.high=max(self.high,stats['max_pq'])
+        self.total+=stats['avg_pq']
+
+    def result(self):
+        raw=dict(min_pq=round(self.low),max_pq=round(self.high),avg_pq=round(self.total/self.count))
+        encoded=dict(min_pq=min(max(raw['min_pq'],0),12),max_pq=min(max(raw['max_pq'],2081),4095))
+        encoded['avg_pq']=min(max(raw['avg_pq'],1229),encoded['max_pq']-1)
+        return dict(start=self.start,duration=self.count,measured_l1=raw,encoded_l1=encoded,compatibility_clamped=raw!=encoded)
+
+
+class StreamingAnalysis:
+    """One pending statistic for detector lookahead; memory scales with shots.
+
+    Global light levels and shot sums preserve the old frame iteration order.
+    Thumbnails are still handled by the unchanged SceneDetector.
+    """
+    def __init__(self):
+        self.count=0;self.pending=None;self.shot=ShotSummary(0);self.shots=[];self.total_y=0.
+        self.maxima=dict.fromkeys(('max_cll_nits','max_fall_nits','max_cie_y_nits','max_frame_mean_y_nits',
+            'max_frame_fraction_maxrgb_gt1000','max_frame_fraction_y_gt1000',
+            'max_frame_fraction_maxrgb_gt1100','max_frame_fraction_y_gt1100'),0.)
+
+    def _consume(self,cut):
+        if self.pending is None:return
+        index,stats=self.pending
+        if cut==index and self.shot.count:
+            self.shots.append(self.shot.result());self.shot=ShotSummary(index)
+        self.shot.add(stats);self.pending=None
+
+    def push(self,stats,cut=None):
+        self._consume(cut)
+        self.pending=(self.count,stats);self.count+=1;self.total_y+=stats['mean_y_nits']
+        values=(stats['max_rgb_nits'],stats['mean_max_rgb_nits'],stats['max_y_nits'],stats['mean_y_nits'],
+            stats['pixels_maxrgb_gt1000']/stats['pixel_count'],stats['pixels_y_gt1000']/stats['pixel_count'],
+            stats['pixels_maxrgb_gt1100']/stats['pixel_count'],stats['pixels_y_gt1100']/stats['pixel_count'])
+        for key,value in zip(self.maxima,values):self.maxima[key]=max(self.maxima[key],value)
+
+    def finish(self,cut=None):
+        if not self.count:raise ValueError('HDR analysis returned no frames')
+        self._consume(cut)
+        if self.shot.count:self.shots.append(self.shot.result());self.shot=ShotSummary(self.count)
+        return {**self.maxima,'mean_y_nits':self.total_y/self.count,'shots':self.shots}
+
+
 def generator_config(frames,shots,profile='8.4'):
     max_cll=max(f['max_rgb_nits'] for f in frames)
     max_fall=max(f['mean_max_rgb_nits'] for f in frames)
+    return generator_from_levels(max_cll,max_fall,shots,profile)
+
+
+def generator_from_levels(max_cll,max_fall,shots,profile='8.4'):
     return dict(cm_version='V40',profile=profile,long_play_mode=False,
         default_metadata_blocks=[{'Level9':dict(length=1,source_primary_index=2)}],
         level6=dict(max_display_mastering_luminance=1000,min_display_mastering_luminance=1,
@@ -142,15 +198,16 @@ def generator_config(frames,shots,profile='8.4'):
 
 
 def analyze(path,output,generator=None,ffmpeg='ffmpeg',ffprobe='ffprobe',fps=None,
-            device='auto',cuts_file=None,progress_path=None,active_area=(0,0,0,0)):
+            device='auto',cuts_file=None,progress_path=None,active_area=(0,0,0,0),frame_stats_path=None):
     media=probe(path,ffprobe)
     video=next(s for s in media['streams'] if s['codec_type']=='video')
     transfer=video.get('color_transfer')
     if transfer not in ('smpte2084','arib-std-b67'):raise ValueError('Final HDR analysis requires explicit PQ or HLG')
     if video.get('color_primaries')!='bt2020':raise ValueError('HDR analysis requires BT.2020')
     rate=float(Fraction(fps)) if fps else frame_rate(video)
-    if rate<=0:raise ValueError('Unknown frame rate')
+    if not np.isfinite(rate) or not 0<rate<=1000:raise ValueError('Invalid frame rate')
     width,height=video['width'],video['height']
+    if not (0<width<=16384 and 0<height<=16384) or width%2 or height%2:raise ValueError('Invalid HDR analysis dimensions')
     left,right,top,bottom=active_area
     if min(active_area)<0 or left+right>=width or top+bottom>=height:raise ValueError('Invalid active area')
     xp=np
@@ -169,18 +226,23 @@ def analyze(path,output,generator=None,ffmpeg='ffmpeg',ffprobe='ffprobe',fps=Non
         if siting not in SITING:native_gpu=False
     chain=(f'zscale=tin={transfer}:pin=bt2020:min={video["color_space"]}:rin={ran}:'
            f't={transfer}:p=bt2020:m=gbr:r=full:agamma=0:filter=bilinear,format=gbrpf32le')
-    command=[ffmpeg,'-v','error','-nostdin','-threads',str(min(8,os.cpu_count() or 1)),'-i',str(path),'-map','0:v:0']
+    command=[ffmpeg,'-v','error','-xerror','-nostdin','-threads',str(min(8,os.cpu_count() or 1)),
+             '-err_detect','explode','-i',str(path),'-map','0:v:0']
     command+=['-pix_fmt','yuv420p10le'] if native_gpu else ['-vf',chain]
     command+=[
              '-fps_mode','passthrough','-an','-sn','-dn','-f','rawvideo',
              '-blocksize',str(CHUNK_BYTES),'pipe:1']
-    frames=[];detector=SceneDetector(max(8,round(rate*.3)));start=time.monotonic()
+    aggregate=StreamingAnalysis();detector=SceneDetector(max(8,round(rate*.3)));start=time.monotonic()
+    manual=json.loads(Path(cuts_file).read_text(encoding='utf-8-sig')) if cuts_file else None
+    if manual is not None and (not isinstance(manual,list) or not manual or manual[0]!=0 or
+        any(type(i) is not int or i<0 for i in manual) or sorted(set(manual))!=manual):raise ValueError('Invalid manual shot cuts')
+    manual_set=set(manual) if manual is not None else None
     count=width*height*3//2 if native_gpu else width*height*3
     dtype='<u2' if native_gpu else '<f4';nbytes=count*np.dtype(dtype).itemsize
     host=np.empty(count,dtype=dtype) if xp is np else np.frombuffer(
         xp.cuda.alloc_pinned_memory(nbytes),dtype=dtype,count=count)
     view=memoryview(host).cast('B')
-    with tempfile.TemporaryFile() as errors:
+    with tempfile.TemporaryFile() as errors, (open(frame_stats_path,'x',encoding='utf-8') if frame_stats_path else nullcontext()) as frame_log:
         child=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=errors,creationflags=CREATE_FLAGS)
         try:
             while True:
@@ -190,43 +252,38 @@ def analyze(path,output,generator=None,ffmpeg='ffmpeg',ffprobe='ffprobe',fps=Non
                 else:rgb=xp.asarray(host.reshape(3,height,width))[[2,0,1]]
                 rgb=rgb[:,top:height-bottom or None,left:width-right or None]
                 stats,thumbnail=frame_statistics(xp,display_rgb(xp,rgb,transfer))
-                frames.append(stats);detector.push(thumbnail)
-                if len(frames)%15==0:progress(progress_path,len(frames),len(frames)/rate)
+                detector.push(thumbnail)
+                cut=aggregate.count-1 if manual_set is not None and aggregate.count-1 in manual_set else detector.cuts[-1] if manual_set is None else None
+                aggregate.push(stats,cut)
+                if frame_log:frame_log.write(json.dumps(stats,separators=(',',':'))+'\n')
+                if aggregate.count%15==0:progress(progress_path,aggregate.count,aggregate.count/rate)
             if child.wait():
                 errors.seek(0);raise RuntimeError(errors.read().decode('utf-8',errors='replace'))
         finally:
             if child.poll() is None:child.kill();child.wait()
             child.stdout.close()
-    if not frames:raise ValueError('HDR analysis returned no frames')
-    cuts=json.loads(Path(cuts_file).read_text(encoding='utf-8-sig')) if cuts_file else detector.finish()
-    shots=make_shots(frames,cuts)
-    config=generator_config(frames,shots,'8.4' if transfer=='arib-std-b67' else '8.1')
+    if manual is not None and manual[-1]>=aggregate.count:raise ValueError('Manual cuts outside decoded frame range')
+    last_cut=aggregate.count-1 if manual_set is not None and aggregate.count-1 in manual_set else detector.finish()[-1] if manual_set is None else None
+    summary=aggregate.finish(last_cut);shots=summary['shots']
+    config=generator_from_levels(summary['max_cll_nits'],summary['max_fall_nits'],shots,'8.4' if transfer=='arib-std-b67' else '8.1')
     if any(active_area):
         config['default_metadata_blocks'].append({'Level5':dict(active_area_left_offset=left,
             active_area_right_offset=right,active_area_top_offset=top,active_area_bottom_offset=bottom)})
-    result=dict(path=str(Path(path).resolve()),frames=len(frames),fps=rate,width=width,height=height,
+    result=dict(path=str(Path(path).resolve()),frames=aggregate.count,fps=rate,width=width,height=height,
         model='BT.2100 HLG 1000nit/gamma1.2/ideal black; ST2084 PQ absolute',
         light_level_method='CTA-861 linear MaxRGB, every pixel of every decoded frame in analysis area',
         active_area=dict(left=left,right=right,top=top,bottom=bottom),
-        max_cll_nits=max(f['max_rgb_nits'] for f in frames),
-        max_fall_nits=max(f['mean_max_rgb_nits'] for f in frames),
-        max_cie_y_nits=max(f['max_y_nits'] for f in frames),
-        max_frame_mean_y_nits=max(f['mean_y_nits'] for f in frames),
-        mean_y_nits=sum(f['mean_y_nits'] for f in frames)/len(frames),
-        max_frame_fraction_maxrgb_gt1000=max(f['pixels_maxrgb_gt1000']/f['pixel_count'] for f in frames),
-        max_frame_fraction_y_gt1000=max(f['pixels_y_gt1000']/f['pixel_count'] for f in frames),
-        max_frame_fraction_maxrgb_gt1100=max(f['pixels_maxrgb_gt1100']/f['pixel_count'] for f in frames),
-        max_frame_fraction_y_gt1100=max(f['pixels_y_gt1100']/f['pixel_count'] for f in frames),
-        shots=shots,scene_detection='manual' if cuts_file else 'conservative RGB-PQ thumbnail cuts with single-frame flash suppression',
+        **summary,scene_detection='manual' if cuts_file else 'conservative RGB-PQ thumbnail cuts with single-frame flash suppression',
         l1_analysis_method='community PQ-encoded MaxRGB measurements; not Dolby proprietary LMS/CM backward compatibility analysis',
         scene_detection_certified=False,dolby_analysis_certified=False,creative_trims_created=False,
         compatibility_clamped_shots=sum(s['compatibility_clamped'] for s in shots),
         analysis_device='cuda' if xp is not np else 'cpu',elapsed_seconds=time.monotonic()-start,
         rgb_reconstruction='BT.2020 NCL / bilinear / '+siting,analysis_native_yuv_gpu=native_gpu,
-        frame_statistics=frames)
+        frame_statistics_file=str(frame_stats_path) if frame_stats_path else None,
+        statistics_storage='streaming aggregates, one-frame lookahead; O(shots) metadata')
     write_json(output,result)
     if generator:write_json(generator,config)
-    print(f'Full HDR analysis: {len(frames)} frames, {len(shots)} shots; MaxCLL={result["max_cll_nits"]:.2f}, MaxFALL={result["max_fall_nits"]:.2f} nit')
+    print(f'Full HDR analysis: {aggregate.count} frames, {len(shots)} shots; MaxCLL={result["max_cll_nits"]:.2f}, MaxFALL={result["max_fall_nits"]:.2f} nit')
     return result
 
 
@@ -236,7 +293,8 @@ if __name__=='__main__':
     parser.add_argument('--ffmpeg',default='ffmpeg');parser.add_argument('--ffprobe',default='ffprobe')
     parser.add_argument('--fps');parser.add_argument('--device',choices=['auto','cpu','cuda'],default='auto')
     parser.add_argument('--cuts-file');parser.add_argument('--active-area',default='0,0,0,0')
+    parser.add_argument('--frame-statistics',help='Optional streaming JSONL diagnostics; never read by PowerShell')
     parser.add_argument('-progress',dest='progress');parser.add_argument('-nostats',action='store_true')
     args=parser.parse_args()
     analyze(args.input,args.output,args.generator,args.ffmpeg,args.ffprobe,args.fps,args.device,args.cuts_file,
-            args.progress,tuple(map(int,args.active_area.split(','))))
+            args.progress,tuple(map(int,args.active_area.split(','))),args.frame_statistics)

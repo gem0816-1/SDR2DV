@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 
 CREATE_FLAGS = subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
 
@@ -30,33 +31,53 @@ def progress(path,frames,seconds=0,phase=None,ended=False):
         try:
             staging.write_text(f'frame={frames}\nout_time_us={int(seconds*1e6)}\n'+phase_line+end_line,encoding='ascii')
             os.replace(staging,target)
-        except PermissionError:
+        except OSError:
             return False
         return True
 
 
 def json_command(command):
     check_cancel()
-    result=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=CREATE_FLAGS)
-    if result.returncode:
-        raise RuntimeError(result.stderr.decode('utf-8',errors='replace'))
-    check_cancel()
-    return json.loads(result.stdout)
+    # Metadata has a deliberately bounded size. Large packet/frame tables use
+    # stream_lines instead. Neither stderr nor stdout accumulate in Python RAM.
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        child=subprocess.Popen(command,stdout=output,stderr=errors,creationflags=CREATE_FLAGS)
+        try:
+            while True:
+                check_cancel()
+                if os.fstat(output.fileno()).st_size>4*1024**2 or os.fstat(errors.fileno()).st_size>16*1024**2:
+                    raise RuntimeError('Probe metadata/log limit exceeded')
+                try:child.wait(timeout=.1);break
+                except subprocess.TimeoutExpired:pass
+            if os.fstat(output.fileno()).st_size>4*1024**2:raise RuntimeError('Probe metadata limit exceeded')
+            if child.returncode or os.fstat(errors.fileno()).st_size:
+                raise RuntimeError('Probe failed: '+error_tail(errors))
+            output.seek(0);check_cancel()
+            return json.load(output)
+        finally:
+            if child.poll() is None:child.kill();child.wait()
+
+
+def error_tail(stream,limit=65536):
+    stream.seek(0,2);stream.seek(max(0,stream.tell()-limit))
+    return stream.read(limit).decode('utf-8',errors='replace')
 
 
 def stream_lines(command):
     # Read ffprobe incrementally; packet tables need not occupy RAM for a film.
-    import tempfile
     with tempfile.TemporaryFile() as errors:
         process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=errors,text=True,
                                  encoding='utf-8',creationflags=CREATE_FLAGS)
         try:
-            for line in process.stdout:
+            while True:
+                line=process.stdout.readline(65537)
+                if not line:break
                 check_cancel()
+                if len(line)>65536:raise RuntimeError('Probe record exceeds line limit')
+                if os.fstat(errors.fileno()).st_size>16*1024**2:raise RuntimeError('Probe error log limit exceeded')
                 yield line.rstrip('\r\n')
-            if process.wait():
-                errors.seek(0)
-                raise RuntimeError(errors.read().decode('utf-8',errors='replace'))
+            if process.wait() or os.fstat(errors.fileno()).st_size:
+                raise RuntimeError('Probe failed: '+error_tail(errors))
         finally:
             if process.poll() is None:
                 process.kill()

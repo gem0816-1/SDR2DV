@@ -73,3 +73,8 @@ Get-FileHash .\SDR2DV-v2.1.0-win-x64.zip -Algorithm SHA256
 
 源码回归：`powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Deploy.Tests.ps1`。
 发布前还需在独立目录运行便携部署、实际短片转换、TrueHDR 推理、重复部署和参数/编码检查。
+
+部署按项目目录互斥，配置文件通过暂存替换发布；不同项目仍可各自管理环境。
+工具下载保持固定 SHA256，ZIP 解压前拒绝路径穿越、ADS、设备名、链接、大小写重复和文件/目录冲突，预检总解压体积（上限8 GiB）与可用空间。
+Python 直接依赖及 Windows/CUDA 传递依赖均固定版本，分别见 `SDR2DV/*-requirements.txt` 与 `*-constraints.txt`；CheckOnly 核对这些版本，重复运行复用已满足的环境。
+这些约束用于版本复现，尚未提供所有 Python wheel 的离线哈希锁定；不能将它们等同于工具 ZIP 的 SHA256 固定或全新机器安装验收。

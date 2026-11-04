@@ -59,6 +59,7 @@ function Get-DeployDownload {
     if ($CacheDirectory.Length -gt [IO.Path]::GetPathRoot($CacheDirectory).Length) { $CacheDirectory = $CacheDirectory.TrimEnd('\') }
     if ([uri]$Asset.url -and ([uri]$Asset.url).Scheme -ne 'https') { throw 'Download URL must use HTTPS.' }
     if ([string]::IsNullOrWhiteSpace($Asset.file) -or $Asset.file -in @('.', '..') -or
+        $Asset.file.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or
         $Asset.file -ne [IO.Path]::GetFileName($Asset.file) -or $Asset.sha256 -notmatch '^[A-Fa-f0-9]{64}$') {
         throw 'Invalid download manifest.'
     }
@@ -111,9 +112,37 @@ function Expand-DeployZip {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $root = [IO.Path]::GetFullPath($Destination).TrimEnd('\') + '\'
     if (Test-Path -LiteralPath $Destination) { throw "Extraction target already exists: $Destination" }
-    New-Item -ItemType Directory -Path $Destination | Out-Null
     $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
     try {
+        # Validate the whole archive before writing the first byte. Windows ADS,
+        # device names, trailing-dot aliases and case duplicates defeat a mere
+        # path prefix check. Archives are also SHA256-pinned before this call.
+        $seen=New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $total=0L
+        foreach ($entry in $zip.Entries) {
+            $name=$entry.FullName.Replace('\','/')
+            if ($name.StartsWith('/') -or $name -match '[:\x00-\x1f]' -or
+                (($entry.ExternalAttributes -shr 16) -band 61440) -eq 40960 -or ($entry.ExternalAttributes -band 1024)) { throw 'Unsafe ZIP entry type or name.' }
+            foreach ($component in $name.TrimEnd('/').Split('/')) {
+                if (-not $component -or $component -in @('.','..')) { throw 'ZIP entry escapes extraction directory.' }
+                if ($component -match '[<>"|?*]|[. ]$|^(?i:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(\.|$)') { throw 'Unsafe Windows ZIP path alias.' }
+            }
+            if (-not $seen.Add($name.TrimEnd('/'))) { throw 'Duplicate ZIP path.' }
+            $total+=$entry.Length
+            if ($total -gt 8GB -or $zip.Entries.Count -gt 100000) { throw 'ZIP extraction size/count limit exceeded.' }
+            $target=[IO.Path]::GetFullPath((Join-Path $Destination $entry.FullName))
+            if (-not $target.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) { throw 'ZIP entry escapes extraction directory.' }
+        }
+        # Reject files masquerading as ancestors before any extraction.
+        $files=New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in $zip.Entries) {if ($entry.Name) {$null=$files.Add($entry.FullName.Replace('\','/'))}}
+        foreach ($entry in $zip.Entries) {
+            $parts=$entry.FullName.Replace('\','/').TrimEnd('/').Split('/')
+            for ($i=1;$i -lt $parts.Length;$i++) {if ($files.Contains(($parts[0..($i-1)] -join '/'))) {throw 'ZIP file/directory conflict.'}}
+        }
+        $available=New-Object IO.DriveInfo([IO.Path]::GetPathRoot($root))
+        if ($available.AvailableFreeSpace -lt $total+256MB) { throw 'Insufficient space for ZIP extraction.' }
+        New-Item -ItemType Directory -Path $Destination | Out-Null
         foreach ($entry in $zip.Entries) {
             $target = [IO.Path]::GetFullPath((Join-Path $Destination $entry.FullName))
             if (-not $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw 'ZIP entry escapes extraction directory.' }

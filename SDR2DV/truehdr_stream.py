@@ -22,6 +22,7 @@ from pq_to_hlg import (rgb_pq_to_nits, rgb_nits_to_hlg, cuda_reference_check,
 from brightness_mapping import luminance_lut, apply_mapping, mapping_info
 from stream_diagnostics import diagnostic_streams, log_tail
 from pipe_io import CHUNK_BYTES, FrameWriteError, write_frame
+from cache_binding import new_binding
 
 HLG_TO_YUV = ('zscale=tin=arib-std-b67:pin=bt2020:min=gbr:rin=full:'
               't=arib-std-b67:p=bt2020:m=bt2020nc:r=limited:agamma=0:'
@@ -66,6 +67,11 @@ def encoder_command(args, width, height, fps, output, pq=False):
                '-color_range', 'tv', '-flush_packets', '1']
     if pq:
         command += ['-tag:v', 'hvc1']
+    binding=getattr(args,'cache_binding',None)
+    if binding:
+        command+=['-metadata','SDR2DV_CACHE_ID='+binding['id'],
+                  '-metadata','SDR2DV_CONFIG_SHA256='+binding['config_sha256']]
+        if pq:command+=['-movflags','+use_metadata_tags']
     return command + [str(output)]
 
 
@@ -117,9 +123,10 @@ def convert(args):
         reference_error = cuda_reference_check(cp)
         width, height = video['width'], video['height']
         report.update(binding=nvvfx.__version__, sdk=nvvfx.get_sdk_version(),
-                      fps=str(fps), input_frames=expected, input_filter=input_filter,
+                      fps=str(fps), input_frames=expected,frames=expected,input_filter=input_filter,width=width,height=height,
                       input_sha256=file_hash(args.input),
                       cuda_reference_max_signal_error=reference_error)
+        args.cache_binding=report['cache_binding']=new_binding(report)
         decode = [args.ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-noautorotate',
                   '-i', args.input, '-map', '0:v:0', '-an', '-sn', '-dn', '-vf', input_filter,
                   '-fps_mode', 'passthrough', '-f', 'rawvideo', '-pix_fmt', 'rgb24',

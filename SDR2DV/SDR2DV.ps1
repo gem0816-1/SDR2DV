@@ -228,6 +228,7 @@ $ErrorActionPreference = 'Stop'
 $script:ScriptVersion = '2.1.0'
 . (Join-Path $PSScriptRoot 'encoding.ps1')
 . (Join-Path $PSScriptRoot 'core.ps1')
+. (Join-Path $PSScriptRoot 'reliability.ps1')
 $script:Defaults = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'defaults.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $defaultMap=@{BrightnessMapping='brightness_mapping';BrightnessStrength='brightness_strength';SkinToneCorrection='skin_tone_correction';
     Encoder='encoder';NvencPreset='nvenc_preset';NvencCq='nvenc_cq';Preset='preset';Crf='crf';Format='format';BitrateMode='bitrate_mode';Mp4AudioCodec='audio_codec'}
@@ -242,9 +243,11 @@ if ($script:MachineMode -or $EventPath) {
     [Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)
 }
 $script:Results=@()
+$script:VideoExtensions = @('.mkv','.mp4','.m4v','.mov','.ts','.m2ts','.mts','.avi','.wmv','.flv','.webm','.vob','.mxf','.h265','.hevc')
 $script:BoundOptions=@{}
 foreach ($name in $PSBoundParameters.Keys) { $script:BoundOptions[$name]=$PSBoundParameters[$name] }
 $savedCancelEnvironment=$env:SDR2DV_CANCEL_FILE
+$env:SDR2DV_CANCEL_FILE=$null
 if ($CancelFile) { $env:SDR2DV_CANCEL_FILE=[IO.Path]::GetFullPath($CancelFile) }
 
 # ---------------------------------------------------------------------------
@@ -366,6 +369,9 @@ function Invoke-MediaWithProgress {
         [string]$ProcessWorkingDirectory = ''
     )
 
+    if (Test-Path -LiteralPath (Join-Path $WorkDir ($LogBaseName+'.stdout.log'))) {
+        $LogBaseName+='_'+[guid]::NewGuid().ToString('N').Substring(0,8)
+    }
     $errLog = Join-Path $WorkDir ($LogBaseName + '.log')
     $progLog = Join-Path $WorkDir ($LogBaseName + '.progress')
     if (Test-Path -LiteralPath $errLog) { Remove-Item -LiteralPath $errLog -Force }
@@ -389,11 +395,16 @@ function Invoke-MediaWithProgress {
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
-    if (-not $proc.Start()) { throw "$What 启动失败" }
-    $errTask = $proc.StandardError.ReadToEndAsync()
-    $outTask = $proc.StandardOutput.ReadToEndAsync()
-    Write-TaskEvent -Type 'stage' -Data @{stage=$Label;process_id=$proc.Id}
+    $started=$false
+    $job=[IntPtr]::Zero
+    $errPump=$null;$outPump=$null
     try {
+    if (-not $proc.Start()) { throw "$What 启动失败" }
+    $started=$true
+    $job=[Sdr2dv.Native]::AttachJob($proc)
+    $errPump=New-Object Sdr2dv.LogPump($proc.StandardError,$errLog)
+    $outPump=New-Object Sdr2dv.LogPump($proc.StandardOutput,(Join-Path $WorkDir ($LogBaseName+'.stdout.log')))
+    Write-TaskEvent -Type 'stage' -Data @{stage=$Label;process_id=$proc.Id}
     $startTime = Get-Date
     $lastUpdate = $startTime
     $printed = $false
@@ -405,8 +416,8 @@ function Invoke-MediaWithProgress {
         $now = Get-Date
         if (($now - $lastUpdate).TotalSeconds -lt 1) { continue }
         $lastUpdate = $now
-        $workDrive = New-Object System.IO.DriveInfo([IO.Path]::GetPathRoot($WorkDir))
-        if ($workDrive.AvailableFreeSpace -lt 1GB) { throw '临时盘可用空间低于 1 GB，已停止本次任务。' }
+        Assert-TaskDiskSpace -Paths (@($WorkDir)+@($script:DiskWatchPaths))
+        if ($errPump.Failure -or $outPump.Failure) { throw ('外部进程日志写入失败，已安全停止：'+$errPump.Failure+' '+$outPump.Failure) }
         if (-not (Test-Path -LiteralPath $progLog)) { continue }
 
         $text = ''
@@ -414,7 +425,10 @@ function Invoke-MediaWithProgress {
             $progressFile = [IO.File]::Open($progLog,[IO.FileMode]::Open,[IO.FileAccess]::Read,
                 ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
             $progressReader = New-Object IO.StreamReader($progressFile)
-            try { $text = $progressReader.ReadToEnd() } finally { $progressReader.Dispose() }
+            try {
+                $null=$progressFile.Seek([math]::Max(0,$progressFile.Length-65536),[IO.SeekOrigin]::Begin)
+                $text = $progressReader.ReadToEnd()
+            } finally { $progressReader.Dispose() }
         } catch { $text = '' }
         if (-not $text) { continue }
 
@@ -448,19 +462,15 @@ function Invoke-MediaWithProgress {
     }
 
     $proc.WaitForExit()
-    $errText = ''
-    try { $errText = $errTask.Result } catch { $errText = '' }
-    if ($errText) {
-        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-        try { [System.IO.File]::WriteAllText($errLog, $errText, $utf8NoBom) } catch { }
-    }
+    if (-not $errPump.Worker.Wait(5000) -or -not $outPump.Worker.Wait(5000)) { throw '外部进程日志管道未关闭。' }
+    if ($errPump.Failure -or $outPump.Failure) { throw '外部进程日志读取或写入失败。' }
+    $errText=$errPump.Tail
     $nativeExit = $proc.ExitCode
     if ($printed -and -not $script:MachineMode) {
         $elapsed = (Get-Date) - $startTime
         $state='完成'; if ($nativeExit -ne 0) { $state='失败' }
         Write-Host ("`r" + ('   {0} {1}，用时 {2}' -f $Label,$state,(Format-Elapsed $elapsed)).PadRight(88))
     }
-    if ($outTask.Result) { [IO.File]::WriteAllText((Join-Path $WorkDir ($LogBaseName+'.stdout.log')),$outTask.Result,(New-Object Text.UTF8Encoding($false))) }
 
     $exitCode = -999
     try { $exitCode = $proc.ExitCode } catch { $exitCode = -999 }
@@ -475,21 +485,18 @@ function Invoke-MediaWithProgress {
     }
     }
     finally {
-        if (-not $proc.HasExited) {
+        if ($started -and -not $proc.HasExited) {
             # Only this invocation's process tree; includes Python's FFmpeg pipes.
             & "$env:SystemRoot\System32\taskkill.exe" /PID $proc.Id /T /F 2>$null | Out-Null
         }
-        try {
-            if ($errTask.Wait(5000) -and $errTask.Result) {
-                [IO.File]::WriteAllText($errLog, $errTask.Result, (New-Object Text.UTF8Encoding($false)))
-            }
-        } catch { }
+        [Sdr2dv.Native]::CloseJob($job)
+        foreach ($pump in @($errPump,$outPump)) { if ($pump) {try { $null=$pump.Worker.Wait(5000) } catch { }} }
         $proc.Dispose()
     }
 }
 
 function Invoke-NativeQuiet {
-    param([string]$Exe, [string[]]$Arguments, [string]$What)
+    param([string]$Exe, [string[]]$Arguments, [string]$What, [switch]$Capture, [switch]$RejectStderr, [int]$MaxChars=4194304)
     Assert-TaskNotCancelled
     $psi=New-Object Diagnostics.ProcessStartInfo
     $psi.FileName=$Exe;$psi.Arguments=Build-ArgumentString $Arguments
@@ -498,22 +505,40 @@ function Invoke-NativeQuiet {
     $psi.StandardOutputEncoding=[Text.Encoding]::UTF8;$psi.StandardErrorEncoding=[Text.Encoding]::UTF8
     $psi.EnvironmentVariables['PYTHONUTF8']='1'
     $child=New-Object Diagnostics.Process;$child.StartInfo=$psi
-    $started=$false
+    $started=$false;$job=[IntPtr]::Zero;$stdout=$null;$stderr=$null
     try {
         if (-not $child.Start()) { throw ($What+' could not start') }
         $started=$true
+        $job=[Sdr2dv.Native]::AttachJob($child)
+        $outLog='';$errLog=''
+        if ($script:CurrentWorkDir) {
+            $id=[guid]::NewGuid().ToString('N')
+            $outLog=Join-Path $script:CurrentWorkDir ($id+'.stdout.log');$errLog=Join-Path $script:CurrentWorkDir ($id+'.stderr.log')
+        }
+        if ($Capture) { $stdout=New-Object Sdr2dv.LogPump($child.StandardOutput,$outLog,$MaxChars) }
+        else { $stdout=New-Object Sdr2dv.LogPump($child.StandardOutput,$outLog) }
+        $stderr=New-Object Sdr2dv.LogPump($child.StandardError,$errLog)
         Write-TaskEvent -Type 'stage' -Data @{stage=$What;process_id=$child.Id}
-        $stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync()
-        while (-not $child.WaitForExit(250)) { Assert-TaskNotCancelled }
-        $output=$stdout.Result+"`n"+$stderr.Result
-        if ($child.ExitCode -ne 0) {
+        while (-not $child.WaitForExit(250)) {
+            Assert-TaskNotCancelled;Assert-TaskDiskSpace
+            if ($stdout.Failure -or $stderr.Failure) { throw '外部进程日志读取或写入失败。' }
+            if ($Capture -and $stdout.Characters -gt $MaxChars) { throw '外部程序结构化输出超过大小上限。' }
+        }
+        if (-not $stdout.Worker.Wait(5000) -or -not $stderr.Worker.Wait(5000)) { throw '外部进程日志管道未关闭。' }
+        if ($stdout.Failure -or $stderr.Failure) { throw '外部进程日志读取或写入失败。' }
+        if ($Capture -and $stdout.Characters -gt $MaxChars) { throw '外部程序结构化输出超过大小上限。' }
+        if ($child.ExitCode -ne 0 -or ($RejectStderr -and $stderr.Characters)) {
+            $output=$stdout.Tail+"`n"+$stderr.Tail
             Write-TaskEvent -Type 'error' -Data @{message=$output;stage=$What}
             throw ('{0} 失败（退出码 {1}）：{2}' -f $What,$child.ExitCode,$output)
         }
+        if ($Capture) { return $stdout.Tail }
     }
     finally {
-        if ($started -and -not $child.HasExited) { & "$env:SystemRoot\System32\taskkill.exe" /PID $child.Id /T /F 2>$null | Out-Null; $child.WaitForExit() }
-        if ($child) { $child.Dispose() }
+        if ($started -and -not $child.HasExited) { & "$env:SystemRoot\System32\taskkill.exe" /PID $child.Id /T /F 2>$null | Out-Null; $null=$child.WaitForExit(5000) }
+        [Sdr2dv.Native]::CloseJob($job)
+        foreach ($pump in @($stdout,$stderr)) { if ($pump) { try {$null=$pump.Worker.Wait(5000)} catch {} } }
+        $child.Dispose()
     }
 }
 
@@ -522,8 +547,8 @@ function Invoke-NativeQuiet {
 # ---------------------------------------------------------------------------
 function Get-MediaInfo {
     param([string]$Path)
-    $raw = & $script:Ffprobe -v error -print_format json -show_format -show_streams -i $Path 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $raw) {
+    $raw=Invoke-NativeQuiet -Exe $script:Ffprobe -Arguments @('-v','error','-print_format','json','-show_format','-show_streams','-show_data_hash','sha256','-i',$Path) -What '媒体参数探测' -Capture -RejectStderr
+    if (-not $raw) {
         throw "ffprobe 无法读取输入文件：$Path"
     }
     return (($raw -join "`n") | ConvertFrom-Json)
@@ -639,20 +664,27 @@ function Get-IncomingVideoInfo {
     if ($video.Count -eq 0) { throw "文件里没有视频流：$Path" }
 
     $v = $video[0]
+    if ($v.disposition.attached_pic -eq 1) {throw '首个视频流是封面图片；请先显式选择真正的视频流。'}
+    if ($v.field_order -in @('tt','bb','tb','bt')) {throw '当前流水线不支持隔行视频；请先明确处理场序，不会隐式去隔行。'}
     $transfer = [string]$v.color_transfer
     $primaries = [string]$v.color_primaries
     $matrix = [string]$v.color_space
     $range = [string]$v.color_range
+    $aliases=@{'gamma22'='bt470m';'gamma28'='bt470bg';'iec61966-2-1'='iec61966_2_1';'iec61966-2-4'='iec61966_2_4';'bt2020-10'='bt2020_10';'bt2020-12'='bt2020_12'}
+    if ($aliases.ContainsKey($transfer)) {$transfer=$aliases[$transfer]}
 
     if ($transfer -eq 'smpte2084' -or $transfer -eq 'arib-std-b67') {
         throw ("输入已经是 HDR（transfer={0}），不是 SDR，本工具只处理 SDR 源。" -f $transfer)
     }
 
-    $knownTransfers = @('bt709', 'gamma22', 'gamma28', 'smpte170m', 'smpte240m', 'linear', 'iec61966_2_1', 'iec61966_2_4', 'bt2020_10', 'bt2020_12')
+    $knownTransfers = @('bt709', 'bt470m', 'bt470bg', 'smpte170m', 'smpte240m', 'linear', 'iec61966_2_1', 'iec61966_2_4', 'bt2020_10', 'bt2020_12')
     $knownPrimaries = @('bt709', 'bt470m', 'bt470bg', 'smpte170m', 'smpte240m', 'film', 'bt2020', 'smpte428', 'smpte431', 'smpte432', 'jedec-p22')
     $knownMatrices = @('bt709', 'fcc', 'bt470bg', 'smpte170m', 'smpte240m', 'bt2020nc', 'bt2020c')
 
-    $inTransfer = 'bt709'
+    if ($transfer -notin $knownTransfers -or $primaries -notin $knownPrimaries -or $matrix -notin $knownMatrices -or $range -notin @('tv','pc','limited','full','mpeg','jpeg')) { throw '输入色彩参数缺失或不受支持；请先明确 SDR transfer/primaries/matrix/range，不会静默假定 BT.709。' }
+    if ([int]$v.width -le 0 -or [int]$v.height -le 0 -or [int]$v.width -gt 16384 -or [int]$v.height -gt 16384 -or [int]$v.width % 2 -or [int]$v.height % 2) { throw '输入尺寸无效；要求正的偶数宽高且单边不超过 16384。' }
+    if (@($v.side_data_list | Where-Object {[math]::Abs([double]$_.rotation) -gt .001}).Count) { throw '请先显式处理视频旋转；不会自动旋转或改变尺寸。' }
+    $inTransfer = $transfer
     if ($knownTransfers -contains $transfer) { $inTransfer = $transfer }
     $inPrimaries = 'bt709'
     if ($knownPrimaries -contains $primaries) { $inPrimaries = $primaries }
@@ -668,7 +700,7 @@ function Get-IncomingVideoInfo {
         $fpsText = [string]$v.avg_frame_rate
         $fps = ConvertTo-FractionValue $fpsText
     }
-    if ($fps -le 0) {
+    if ($fps -le 0 -or [double]::IsNaN($fps) -or [double]::IsInfinity($fps) -or $fps -gt 1000) {
         throw '无法确定源帧率；不会猜测为 25fps。'
     }
     $avgFps = ConvertTo-FractionValue ([string]$v.avg_frame_rate)
@@ -676,9 +708,15 @@ function Get-IncomingVideoInfo {
 
     $audioStreams = @($info.streams | Where-Object { $_.codec_type -eq 'audio' })
     $subtitleStreams = @($info.streams | Where-Object { $_.codec_type -eq 'subtitle' })
+    foreach ($audioStream in $audioStreams) {
+        $sampleRate=Get-NumericValue $audioStream.sample_rate
+        if ($sampleRate -lt 1 -or $sampleRate -gt 768000 -or [int]$audioStream.channels -lt 1 -or [int]$audioStream.channels -gt 64) {throw '音轨采样率或声道数无效，未启动编码。'}
+        if ($audioStream.codec_name -like 'pcm_*' -and (Get-NumericValue $audioStream.start_time) -lt -.0001) {throw 'PCM 音轨在视频零点之前开始；当前封装无法保证保留负时间采样，请先显式准备时间线。'}
+    }
 
     $duration = 0.0
     if ($info.format -and $info.format.duration) { $duration = Get-NumericValue $info.format.duration }
+    if ($duration -le 0 -or [double]::IsNaN($duration) -or [double]::IsInfinity($duration) -or $duration*$fps -gt [int]::MaxValue) { throw '输入时长无效或预计帧数超出 RPU/PowerShell 支持范围。' }
 
     return @{
         Path = $Path
@@ -696,6 +734,7 @@ function Get-IncomingVideoInfo {
         InRange = $rangeMode
         AudioStreams = $audioStreams
         SubtitleStreams = $subtitleStreams
+        AttachmentStreams = @($info.streams | Where-Object {$_.codec_type -eq 'attachment'})
         SourceStream = $v
     }
 }
@@ -708,12 +747,12 @@ function Get-HevcFrameCount {
     # Our libx265 output contains one coded picture per access unit. Count
     # parsed packets first instead of decoding a whole 4K film just to count.
     # Keep the decoder-based fallback for formats without packet counts.
-    $raw = & $script:Ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 $Path 2>$null
+    $raw=Invoke-NativeQuiet -Exe $script:Ffprobe -Arguments @('-v','error','-select_streams','v:0','-count_packets','-show_entries','stream=nb_read_packets','-of','csv=p=0',$Path) -What '编码帧数探测' -Capture -RejectStderr
     $text = (($raw -join '') -replace '[^0-9]', '')
     $count = 0
     [int]::TryParse($text, [ref]$count) | Out-Null
     if ($count -le 0) {
-        $raw = & $script:Ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 $Path 2>$null
+        $raw=Invoke-NativeQuiet -Exe $script:Ffprobe -Arguments @('-v','error','-select_streams','v:0','-count_frames','-show_entries','stream=nb_read_frames','-of','csv=p=0',$Path) -What '解码帧数探测' -Capture -RejectStderr
         $text = (($raw -join '') -replace '[^0-9]', '')
         [int]::TryParse($text, [ref]$count) | Out-Null
     }
@@ -925,11 +964,13 @@ function New-MkvOutput {
 
     $remuxArgs = @('-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
         '-copyts','-i', $interimMp4, '-ss', '0', '-i', $Info.Path,
-        '-map', '0:v:0', '-map', '1:a?', '-map', '1:s?',
+        '-map', '0:v:0', '-map', '1:a?', '-map', '1:s?', '-map', '1:t?',
         '-c', 'copy', '-avoid_negative_ts', 'disabled', '-map_chapters', '1', '-map_metadata', '1',
         $OutputPath)
+    $remuxArgs=@($remuxArgs[0..($remuxArgs.Count-2)])+@($Info.SubtitlePlan)+@($OutputPath)
     Invoke-NativeQuiet -Exe $script:Ffmpeg -Arguments $remuxArgs -What 'MKV 封装（音轨/字幕）'
     $mkvMedia = Get-MediaInfo -Path $OutputPath
+    Test-MkvSubtitles -Info $Info -Media $mkvMedia
     $mkvVideo = @($mkvMedia.streams | Where-Object { $_.codec_type -eq 'video' })[0]
     if ([math]::Abs((Get-NumericValue $mkvMedia.format.duration) - $Info.Duration) -ge 0.1 -or
         ($HdrMode -eq 'TrueHDR' -and [math]::Abs((Get-NumericValue $mkvVideo.start_time)) -ge 0.01)) {
@@ -961,10 +1002,10 @@ function Test-RpuInContainer {
     $checkHevc = Join-Path $WorkDir 'check_stream.hevc'
     Invoke-NativeQuiet -Exe $script:Ffmpeg -Arguments @('-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
         '-i', $Path, '-map', '0:v:0', '-c:v', 'copy', '-bsf:v', 'hevc_mp4toannexb', '-f', 'hevc', $checkHevc) -What '容器校验用 Annex B 提取'
-    & $DoviExe extract-rpu $checkHevc -o $checkRpu 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $checkRpu)) { return $false }
+    Invoke-NativeQuiet -Exe $DoviExe -Arguments @('extract-rpu',$checkHevc,'-o',$checkRpu) -What '最终 RPU 提取'
+    if (-not (Test-Path -LiteralPath $checkRpu)) { return $false }
 
-    $raw = & $DoviExe info -i $checkRpu -s 2>$null
+    $raw=Invoke-NativeQuiet -Exe $DoviExe -Arguments @('info','-i',$checkRpu,'-s') -What '最终 RPU 帧数探测' -Capture
     $text = ($raw -join "`n")
     $frames = 0
     if ($text -match 'Frames:\s*(\d+)') { $frames = [int]$Matches[1] }
@@ -983,7 +1024,7 @@ function Convert-SingleFile {
 
     $fileStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $sourceItem = Get-Item -LiteralPath $SourcePath
-    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($sourceItem.Name)
+    $baseName = Get-InputBaseName $sourceItem
 
     if (-not $OutputDir) {
         $targetDir = $sourceItem.DirectoryName
@@ -1011,20 +1052,28 @@ function Convert-SingleFile {
         $outputs += @{ Kind = 'mkv'; Path = (Join-Path $targetDir ($baseName + $suffix + '.mkv')) }
     }
 
-    $pending = @()
-    foreach ($o in $outputs) {
-        if ((Test-Path -LiteralPath $o.Path) -and -not $Force) {
-            Write-Log ('跳过（已存在）：{0}（用 -Force 覆盖）' -f $o.Path) 'WARN'
-        }
-        else {
-            $pending += $o
-        }
+    $hdr10Suffix='_TrueHDR_HDR10.mp4'
+    if ($BrightnessMapping -eq 'Reference' -and $BrightnessStrength -gt 0) {$hdr10Suffix='_TrueHDR_Ref_HDR10.mp4'}
+    elseif ($BrightnessMapping -eq 'Natural' -and $BrightnessStrength -gt 0) {$hdr10Suffix='_TrueHDR_Natural_HDR10.mp4'}
+    elseif ($BrightnessMapping -eq 'realDolby' -and $BrightnessStrength -gt 0) {$hdr10Suffix='_TrueHDR_realDolby_HDR10.mp4'}
+    if ($KeepHDR10) { $outputs+=@{Kind='hdr10';Path=(Join-Path $targetDir ($baseName+$hdr10Suffix))} }
+    $tx=New-OutputTransaction -Outputs $outputs -Overwrite:$Force
+    $cacheHandles=@()
+    $previousDiskPaths=$script:DiskWatchPaths;$previousWork=$script:CurrentWorkDir
+    try {
+    $cacheHandles+=@([IO.File]::Open($sourceItem.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read))
+    foreach ($output in $outputs) {
+        if ($output -notin $tx.Pending) { Write-Log ('跳过（已存在）：'+$output.Path+'（用 -Force 覆盖）') 'WARN' }
     }
-    if ($pending.Count -eq 0) {
-        Write-Log '所有输出已存在，跳过。' 'WARN'
-        return
+    if (-not $tx.Pending.Count) {
+        $script:Results+=@{source=$sourceItem.FullName;status='skipped';outputs=@()}
+        return 'Skipped'
     }
-
+    $pending=@($tx.Pending | Where-Object {$_.Kind -ne 'hdr10'})
+    $deliveries=@()
+    $publishHDR10=(@($tx.Pending | Where-Object {$_.Kind -eq 'hdr10'}).Count -gt 0)
+    $KeepHDR10=$publishHDR10
+    Assert-TaskDiskSpace @($targetDir,$script:WorkRoot)
     Write-Log ('处理：{0}' -f $sourceItem.Name) 'STEP'
 
     # 1. 探测
@@ -1044,15 +1093,20 @@ function Convert-SingleFile {
         throw '检测到可变帧率；当前原始 HEVC 封装不能保留其时间线，不会自动抽帧或补帧。'
     }
 
+    if (@($pending | Where-Object {$_.Kind -eq 'mkv'}).Count) { $info.SubtitlePlan=Get-MkvSubtitlePlan $info }
+
     # 2. 工作目录（必须 ASCII：Dolby mp4muxer 不支持非 ASCII 路径）
     $tempRoot = $script:WorkRoot
     if (-not (Test-Path -LiteralPath $tempRoot)) {
         New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
     }
     $safeName = $baseName -replace '[^A-Za-z0-9\.\-]', '_'
+    if ($safeName.Length -gt 64) {$safeName=$safeName.Substring(0,64)}
     if (-not $safeName -or $safeName -match '^_*$') { $safeName = 'video' }
-    $workDir = Join-Path $tempRoot ('{0}_{1}_{2}' -f $safeName, (Get-Date -Format 'HHmmss'), ([guid]::NewGuid().ToString('N').Substring(0, 8)))
-    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+    $workDir = Join-Path $tempRoot ('{0}_{1}_{2}' -f $safeName, (Get-Date -Format 'HHmmss'), ([guid]::NewGuid().ToString('N')))
+    New-Item -ItemType Directory -Path $workDir | Out-Null
+    $script:CurrentWorkDir=$workDir
+    $script:DiskWatchPaths=@($workDir,$targetDir)
     Write-TaskEvent -Type 'workspace' -Data @{path=$workDir}
 
     try {
@@ -1060,6 +1114,11 @@ function Convert-SingleFile {
         $rateRecord=Get-CoreVideoRate -Path $sourceItem.FullName -WorkDir $workDir -Plan
         if ($HdrMode -eq 'Original') { $info.SourceFrameCount=[int]$rateRecord.timing.frames }
         $sourceBps=[long]$rateRecord.video_bitrate.bps
+        $budgetVideo=[math]::Max(0,$sourceBps*$info.Duration/8)
+        if ($rateRecord.rate_plan.target_kbps -gt 0) {$budgetVideo=1000.0*$rateRecord.rate_plan.target_kbps*$info.Duration/8}
+        $outputBudget=[long]($budgetVideo*[math]::Max(1,$tx.Pending.Count)+$sourceItem.Length)
+        Assert-TaskDiskSpace @($targetDir) (1GB+$outputBudget)
+        Assert-TaskDiskSpace @($workDir) (1GB+[long](6*$budgetVideo))
         $VideoBitrate=[int]$rateRecord.rate_plan.target_kbps
         $MaxVideoBitrate=[int]$rateRecord.rate_plan.max_kbps
         if ($VideoBitrate -gt 0 -and $MaxVideoBitrate -lt $VideoBitrate) { throw '码率上限低于源码率匹配目标；请选择 Platform 模式或提高上限。' }
@@ -1069,7 +1128,7 @@ function Convert-SingleFile {
         }
         if ($Bilibili -and $sourceBps -gt 30000000 -and $BitrateMode -ne 'Platform') { Write-Log '源码率高于B站公开建议的 30 Mbps；保留源码率目标。若要兼容预设，请明确使用 -BitrateMode Platform。' 'WARN' }
         if ($sourceBps/($info.Width*$info.Height*$info.Fps) -lt .04) { Write-Log '源视频码率相对尺寸/帧率偏低；同码率不能保证 HDR 画质，不会将码率相同称为无损。' 'WARN' }
-        $fileReport=@{source=$sourceItem.FullName;source_video_bps=$sourceBps;target_video_bps=1000L*$VideoBitrate;
+        $fileReport=@{status='converted';source=$sourceItem.FullName;source_video_bps=$sourceBps;target_video_bps=1000L*$VideoBitrate;
             bitrate_mode=$BitrateMode;source_audio_precheck=@($rateRecord.audio_precheck);outputs=@();platform_playback_verified=$false}
         if ($Bilibili) {
             foreach ($audioSpec in @($rateRecord.audio_precheck)) { Write-Log ('Hi-Res 源规格预检：{0} Hz / {1}bit；{2}' -f $audioSpec.sample_rate,$audioSpec.effective_bits,$audioSpec.note) }
@@ -1128,14 +1187,21 @@ function Convert-SingleFile {
             $backendArgs += @('--cache-encoder', $Encoder.ToLowerInvariant())
             if ($TrueHDRDebandingOff) { $backendArgs += '--debanding-off' }
             if ($TrueHDRCache) {
+                Assert-NoReparsePath $TrueHDRCache
+                foreach ($cacheName in @('truehdr-report.json','truehdr_hlg.mkv','truehdr_pq.mkv','HDR10_video.mp4')) {
+                    $cachePath=Join-Path $TrueHDRCache $cacheName
+                    if ([IO.File]::Exists($cachePath)) { Assert-NoReparsePath $cachePath;$cacheHandles+=@([IO.File]::Open($cachePath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)) }
+                }
                 $cacheArgs = @('-B', $backend, '--verify-cache', $TrueHDRCache, '--input', $sourceItem.FullName,
                     '--luminance', [string]$TrueHDRLuminance, '--contrast', [string]$TrueHDRContrast,
                     '--saturation', [string]$TrueHDRSaturation, '--middle-gray', [string]$TrueHDRMiddleGray)
                 if ($TrueHDRDebandingOff) { $cacheArgs += '--debanding-off' }
                 Write-Log '核验已完成的 TrueHDR 缓存（源 SHA256、媒体 SHA256、全部 SDK 参数）…'
-                $cacheText = & $script:TrueHDRPython @cacheArgs 2>&1
-                if ($LASTEXITCODE -ne 0) { throw ('TrueHDR 缓存校验失败：{0}' -f ($cacheText -join "`n")) }
+                $cacheText=Invoke-NativeQuiet -Exe $script:TrueHDRPython -Arguments $cacheArgs -What 'TrueHDR 缓存校验' -Capture
                 $cacheInfo = ($cacheText -join "`n") | ConvertFrom-Json
+                if ($cacheInfo.cache_binding_status -like 'legacy*' -or $cacheInfo.kind -eq 'pq-rgb-ffv1-v1') {
+                    Write-Log '旧版缓存只有媒体/源 SHA256，调色解释未绑定到媒体内部身份；本次保留兼容，建议重新生成缓存。' 'WARN'
+                }
                 Copy-Item -LiteralPath $cacheInfo.manifest -Destination (Join-Path $workDir 'truehdr-cache-manifest.json')
                 if ($cacheInfo.kind -eq 'hlg-yuv420p10-lossless-v1') {
                     $hlgSource = [string]$cacheInfo.hlg
@@ -1254,7 +1320,11 @@ function Convert-SingleFile {
                 if ($hdr10Video.codec_name -ne 'hevc' -or $hdr10Video.profile -ne 'Main 10' -or
                     $hdr10Video.color_transfer -ne 'smpte2084' -or $hdr10Video.color_primaries -ne 'bt2020' -or
                     $hdr10Video.color_space -ne 'bt2020nc') { throw 'HDR10 对照文件编码/色彩标记校验失败。' }
-                Move-Item -LiteralPath $hdr10Work -Destination $hdr10Target -Force:$Force
+                $hdr10Rate=Get-CoreVideoRate -Path $hdr10Work -WorkDir $workDir -Packets
+                if ($TrueHDRCache) {$expectedHDR10=$cacheInfo.frames}
+                else {$expectedHDR10=(Get-Content (Join-Path $workDir 'truehdr-report.json') -Raw -Encoding UTF8 | ConvertFrom-Json).input_frames}
+                Test-CoreVideoOutput -Info $info -Record $hdr10Rate -ExpectedFrames $expectedHDR10
+                $deliveries+=@{Path=$hdr10Target;Source=$hdr10Work}
             }
         }
 
@@ -1274,7 +1344,7 @@ function Convert-SingleFile {
 
         $encodeArgs = @(
             '-hide_banner', '-loglevel', 'warning', '-nostdin', '-y',
-            '-i', $encodeSource,
+            '-noautorotate', '-err_detect', 'explode', '-i', $encodeSource,
             '-map', '0:v:0', '-an', '-sn', '-dn',
             '-fps_mode', 'passthrough',
             '-vf', $encodeZscale
@@ -1384,8 +1454,8 @@ function Convert-SingleFile {
                 $audioCheck=Test-CoreAudio -Info $info -Path $muxTarget -WorkDir $workDir
                 $actualRate=Get-CoreVideoRate -Path $muxTarget -WorkDir $workDir -Packets
                 Test-CoreVideoOutput -Info $info -Record $actualRate -ExpectedFrames $frameCount
-                Move-Item -LiteralPath $muxTarget -Destination $target.Path -Force:$Force
-                $results += @{ Path = $target.Path; Size = (Get-Item -LiteralPath $target.Path).Length }
+                $deliveries+=@{Path=$target.Path;Source=$muxTarget}
+                $results += @{ Path = $target.Path; Size = (Get-Item -LiteralPath $deliveries[-1].Source).Length }
                 Write-Log ('  校验通过：DV Profile {0}，兼容 ID={1}，transfer={2}' -f $Profile, $script:DvCompatibilityId, $script:OutputTransfer) 'OK'
             }
             else {
@@ -1398,8 +1468,8 @@ function Convert-SingleFile {
                 $audioCheck=Test-CoreAudio -Info $info -Path $mkvTarget -WorkDir $workDir
                 $actualRate=Get-CoreVideoRate -Path $mkvTarget -WorkDir $workDir -Packets
                 Test-CoreVideoOutput -Info $info -Record $actualRate -ExpectedFrames $frameCount
-                Move-Item -LiteralPath $mkvTarget -Destination $target.Path -Force:$Force
-                $results += @{ Path = $target.Path; Size = (Get-Item -LiteralPath $target.Path).Length }
+                $deliveries+=@{Path=$target.Path;Source=$mkvTarget}
+                $results += @{ Path = $target.Path; Size = (Get-Item -LiteralPath $deliveries[-1].Source).Length }
                 Write-Log '  校验通过：RPU 在流内，帧数匹配' 'OK'
             }
             $deviation=$null
@@ -1411,6 +1481,8 @@ function Convert-SingleFile {
             $fileReport.outputs+=@{path=$target.Path;frames=$frameCount;actual_video_bps=$actualRate.video_bitrate.bps;
                 deviation_percent=$deviation;audio=$audioCheck}
         }
+        Complete-OutputTransaction -Transaction $tx -Deliveries $deliveries
+        $fileReport.delivery='committed';$fileReport.hdr10_outputs=@($deliveries | Where-Object {$_.Path -like '*_HDR10.mp4'} | ForEach-Object {$_.Path})
         $script:Results+=$fileReport
         Write-TaskEvent -Type 'completed' -Data $fileReport
 
@@ -1419,6 +1491,7 @@ function Convert-SingleFile {
         foreach ($r in $results) {
             Write-Log ('  {0}  →  {1}' -f (Format-Size $r.Size), $r.Path) 'DIM'
         }
+        return 'Converted'
     }
     catch {
         if (-not ($_.Exception -is [OperationCanceledException])) {
@@ -1441,6 +1514,9 @@ function Convert-SingleFile {
             [StringComparison]::OrdinalIgnoreCase)
         if (Test-Path -LiteralPath $resolvedWork) {
             $safeCleanup = $safeCleanup -and -not ((Get-Item -LiteralPath $resolvedWork).Attributes -band [IO.FileAttributes]::ReparsePoint)
+            if ($safeCleanup) {
+                try {$safeCleanup=Test-OwnedTreeWithoutLinks $resolvedWork} catch {$safeCleanup=$false}
+            }
         }
         if ($KeepTemp) {
             Write-Log ('中间文件保留在：{0}' -f $resolvedWork) 'DIM'
@@ -1468,6 +1544,12 @@ function Convert-SingleFile {
             }
         }
     }
+    } finally {
+        foreach ($handle in $cacheHandles) {$handle.Dispose()}
+        $script:DiskWatchPaths=$previousDiskPaths;$script:CurrentWorkDir=$previousWork
+        Close-OutputTransaction $tx
+    }
+
 }
 
 # ===========================================================================
@@ -1483,7 +1565,10 @@ Write-Host ''
 }
 
 $exitCode = 0
+$script:SidecarsReady=$false
 try {
+    Initialize-TaskSidecars
+    $script:SidecarsReady=$true
     if ($GetCapabilities) {
         Get-CoreCapabilities | ConvertTo-Json -Depth 10
         exit 0
@@ -1577,12 +1662,12 @@ try {
         $probeDir=Join-Path $script:WorkRoot ('probe_'+[guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $probeDir | Out-Null
         try {
-            $description=Get-CoreVideoRate -Path $InputPath -WorkDir $probeDir -Plan
             $sourceInfo=Get-IncomingVideoInfo -Path $InputPath
+            $description=Get-CoreVideoRate -Path $InputPath -WorkDir $probeDir -Plan
             $audioPlan=$null;$audioError=$null;$alacError=$null
             try { $audioPlan=Get-Mp4AudioRemuxPlan -AudioStreams $sourceInfo.AudioStreams -AudioCodec 'auto' -ForBilibili:$Bilibili } catch { $audioError=$_.Exception.Message }
             try { $null=Get-Mp4AudioRemuxPlan -AudioStreams $sourceInfo.AudioStreams -AudioCodec 'alac' -ForBilibili:$Bilibili } catch { $alacError=$_.Exception.Message }
-            @{schema=1;path=$InputPath;media=$description.media;video_bitrate=$description.video_bitrate;rate_plan=$description.rate_plan;audio_precheck=@($description.audio_precheck);truehdr_input_error=$description.truehdr_input_error;audio_plan=$audioPlan;audio_plan_error=$audioError;alac_plan_error=$alacError} | ConvertTo-Json -Depth 14
+            @{schema=1;path=$InputPath;output_base_name=(Get-InputBaseName (Get-Item -LiteralPath $InputPath));media=$description.media;video_bitrate=$description.video_bitrate;rate_plan=$description.rate_plan;audio_precheck=@($description.audio_precheck);truehdr_input_error=$description.truehdr_input_error;audio_plan=$audioPlan;audio_plan_error=$audioError;alac_plan_error=$alacError} | ConvertTo-Json -Depth 14
         }
         finally {
             $fullProbe=[IO.Path]::GetFullPath($probeDir)
@@ -1591,6 +1676,7 @@ try {
         }
         exit 0
     }
+    $script:GpuTaskLock=Enter-GpuTaskLock
     if ($Encoder -eq 'NVENC' -and $Profile -ne '8.4') { throw 'NVENC 当前仅支持 Profile 8.4 / HLG；8.1 / HDR10 基础层请使用 -Encoder x265。' }
     if ($Encoder -eq 'NVENC' -and $PSBoundParameters.ContainsKey('Crf')) { throw 'NVENC 质量模式请用 -NvencCq；需要 CRF 时使用 -Encoder x265。' }
     if ($Encoder -eq 'Auto' -and ($Profile -ne '8.4' -or $PSBoundParameters.ContainsKey('Crf'))) { $Encoder = 'x265' }
@@ -1603,13 +1689,13 @@ try {
     Write-Log ('  视频编码 : {0}' -f $Encoder) 'DIM'
 
     $inputItem = Get-Item -LiteralPath $InputPath
-    $videoExtensions = @('.mkv', '.mp4', '.m4v', '.mov', '.ts', '.m2ts', '.mts', '.avi', '.wmv', '.flv', '.webm', '.vob', '.mxf', '.h265', '.hevc')
     $files = @()
 
     if ($inputItem.PSIsContainer) {
         $files = @(Get-ChildItem -LiteralPath $inputItem.FullName -File -ErrorAction SilentlyContinue |
-            Where-Object { $videoExtensions -contains $_.Extension.ToLowerInvariant() } |
-            Where-Object { $_.Name -notmatch '_DV(81|84)\.|_TrueHDR(_Ref|_Natural)?_HDR10\.' } |
+            Where-Object { $script:VideoExtensions -contains $_.Extension.ToLowerInvariant() } |
+            Where-Object { $_.FullName -notin @($EventPath,$ReportPath,$CancelFile) } |
+            Where-Object { -not (Test-GeneratedVideoName $_.Name) } |
             Sort-Object Name)
         if ($files.Count -eq 0) { throw '文件夹里没有找到可处理的视频文件。' }
         Write-Log ('批量模式：找到 {0} 个文件' -f $files.Count) 'STEP'
@@ -1617,18 +1703,25 @@ try {
     else {
         $files = @($inputItem)
     }
+    $plannedNames=@{}
+    foreach ($file in $files) {
+        $name=Get-InputBaseName $file
+        if ($plannedNames.ContainsKey($name)) { throw ('批量输入仍发生输出名碰撞，未启动任何转换：'+$file.FullName+' / '+$plannedNames[$name]) }
+        $plannedNames[$name]=$file.FullName
+    }
 
     $totalWatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $succeeded = @()
+    $succeeded = @();$skipped=@()
     $failed = @()
 
     foreach ($file in $files) {
         try {
-            Convert-SingleFile -SourcePath $file.FullName
-            $succeeded += $file.Name
+            $outcome=Convert-SingleFile -SourcePath $file.FullName
+            if ($outcome -eq 'Skipped') { $skipped+=$file.Name } else { $succeeded += $file.Name }
         }
         catch {
             if ($CancelFile -and (Test-Path -LiteralPath $CancelFile)) { $exitCode=130;Write-TaskEvent -Type 'cancelled' -Data @{message='本次任务已取消'};break }
+            $script:Results+=@{source=$file.FullName;status='failed';error=$_.Exception.Message;outputs=@()}
             $failed += @{ Name = $file.Name; Error = $_.Exception.Message }
             Write-Log ('失败：{0} → {1}' -f $file.Name, $_.Exception.Message) 'ERR'
         }
@@ -1639,6 +1732,7 @@ try {
     Write-Log '================ 汇总 ================' 'STEP'
     Write-Log ('总用时：{0}' -f (Format-Elapsed $totalWatch.Elapsed))
     Write-Log ('成功：{0} 个' -f $succeeded.Count) 'OK'
+    Write-Log ('跳过：{0} 个' -f $skipped.Count)
     if ($failed.Count -gt 0) {
         Write-Log ('失败：{0} 个' -f $failed.Count) 'ERR'
         foreach ($f in $failed) { Write-Log ('  {0} → {1}' -f $f.Name, $f.Error) 'ERR' }
@@ -1649,17 +1743,18 @@ try {
 catch {
     Write-Host ''
     Write-Log ($_.Exception.Message) 'ERR'
+    if ($script:MachineMode) {@{schema=1;error=$_.Exception.Message} | ConvertTo-Json -Compress}
     $exitCode = 1
 }
 
 finally {
+    if ($script:GpuTaskLock) { $script:GpuTaskLock.ReleaseMutex();$script:GpuTaskLock.Dispose() }
     $env:SDR2DV_CANCEL_FILE=$savedCancelEnvironment
-    if ($savedConsoleEncoding) { [Console]::OutputEncoding=$savedConsoleEncoding }
-    if ($ReportPath) {
-        [IO.File]::WriteAllText([IO.Path]::GetFullPath($ReportPath),
-            (@{schema=1;results=$script:Results;exit_code=$exitCode;platform_playback_verified=$false} | ConvertTo-Json -Depth 24),
-            (New-Object Text.UTF8Encoding($false)))
+    if ($ReportPath -and $script:SidecarsReady) {
+        try { Save-TaskReport -Path $ReportPath -Data @{schema=1;results=$script:Results;exit_code=$exitCode;platform_playback_verified=$false}
+        } catch { Write-Warning ('结果报告不可写：'+$_.Exception.Message) }
     }
+    if ($savedConsoleEncoding) { [Console]::OutputEncoding=$savedConsoleEncoding }
 }
 
 exit $exitCode

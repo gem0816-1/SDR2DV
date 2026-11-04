@@ -39,19 +39,25 @@ def verify_cache(args):
         raise ValueError('TrueHDR cache did not finish successfully or its SDK parameters differ')
     if report.get('input_sha256') != file_hash(args.input):
         raise ValueError('TrueHDR cache source SHA256 does not match this input')
+    if type(report.get('frames')) is not int or not 0<report['frames']<=2147483647:
+        raise ValueError('Invalid cache frame count')
     if report.get('cache_kind') == 'hlg-yuv420p10-lossless-v1':
         hlg = manifest.parent / 'truehdr_hlg.mkv'
         if report.get('hlg_file_sha256') != file_hash(hlg):
             raise ValueError('TrueHDR HLG cache SHA256 mismatch')
+        from cache_binding import verify_binding
+        binding_status=verify_binding(report,hlg,getattr(args,'ffprobe','ffprobe'))
         hdr10 = manifest.parent / 'HDR10_video.mp4'
         hdr10_path = ''
         if report.get('hdr10_file_sha256'):
             if report['hdr10_file_sha256'] != file_hash(hdr10):
                 raise ValueError('TrueHDR HDR10 cache SHA256 mismatch')
+            verify_binding(report,hdr10,getattr(args,'ffprobe','ffprobe'))
             hdr10_path = str(hdr10)
-        return dict(verified=True, kind=report['cache_kind'], hlg=str(hlg), hdr10=hdr10_path,
+        return dict(verified=True, kind=report['cache_kind'], hlg=str(hlg), hdr10=hdr10_path,cache_binding_status=binding_status,
                     brightness_mapping=report.get('brightness_mapping',dict(name='neutral',strength=0.)),
                     manifest=str(manifest), frames=report['frames'], sdk=report['sdk'])
+    if report.get('cache_kind') not in (None,'pq-rgb-ffv1-v1'):raise ValueError('Unsupported cache kind')
     pq = manifest.parent / 'truehdr_pq.mkv'
     if report.get('pq_file_sha256') != file_hash(pq):
         raise ValueError('TrueHDR cache PQ SHA256 mismatch')
@@ -59,7 +65,8 @@ def verify_cache(args):
 
 
 def run_json(args):
-    return json.loads(subprocess.check_output(args, creationflags=CREATE_FLAGS))
+    from task_io import json_command
+    return json_command(args)
 
 
 def runtime():
@@ -102,40 +109,38 @@ def check(args):
 
 
 def timing(args, video):
-    from task_io import check_cancel, progress
+    from task_io import check_cancel, progress, stream_lines
     fps = Fraction(video['r_frame_rate'])
     if fps <= 0:
         raise ValueError('TrueHDR requires a known CFR frame rate')
     # Check decoded presentation times, not merely r_frame_rate==avg_frame_rate.
     cmd = [args.ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_frames',
            '-show_entries', 'frame=best_effort_timestamp_time', '-of', 'csv=p=0', args.input]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, creationflags=CREATE_FLAGS)
     last = None
     count = 0
     progress(getattr(args,'progress',None),0,0,phase='source_timing')
+    if not 0<float(fps)<=1000:raise ValueError('Invalid/unsupported frame rate')
+    lines=stream_lines(cmd)
     try:
-        for line in p.stdout:
+        for line in lines:
             check_cancel()
             field = line.strip().split(',')[0]
-            if not field:
-                continue
+            if not field:continue
             t = float(field)
+            import math
+            if not math.isfinite(t):raise ValueError('Non-finite source PTS')
             if last is None and abs(t) > .001:
                 raise ValueError('TrueHDR currently requires video start PTS=0; no implicit timestamp reset')
             if last is not None and abs(t - last - float(1 / fps)) > .0011:
                 raise ValueError('TrueHDR currently rejects VFR/discontinuous PTS to protect audio sync')
             last = t
             count += 1
+            if count>2147483647:raise ValueError('Frame count exceeds the supported RPU/PowerShell range')
             if count % 120 == 0:
                 progress(getattr(args,'progress',None),count,count/float(fps),phase='source_timing')
-        err = p.stderr.read()
-        if p.wait() or count == 0:
-            raise RuntimeError(f'PTS scan failed: {err}')
+        if count == 0:raise RuntimeError('PTS scan returned no frames')
     finally:
-        if p.poll() is None:
-            p.kill()
-            p.wait()
+        lines.close()
     return fps, count
 
 
@@ -155,6 +160,8 @@ def source_video_filter(video):
     """Metadata-only preflight, shared with the core's TUI probe."""
     if video.get('color_transfer') in ('smpte2084', 'arib-std-b67'):
         raise ValueError('TrueHDR accepts SDR only')
+    if video.get('field_order') in ('tt','bb','tb','bt') or video.get('disposition',{}).get('attached_pic'):
+        raise ValueError('TrueHDR requires progressive video, not interlaced fields or cover art')
     for field in ('color_transfer', 'color_space', 'color_primaries', 'color_range'):
         if video.get(field) in (None, 'unknown', 'unspecified'):
             raise ValueError(f'TrueHDR requires explicit input {field}; source interpretation is ambiguous')
@@ -175,7 +182,7 @@ def source_video_filter(video):
     if bits>8 or video.get('pix_fmt') not in verified_8bit:
         raise ValueError('NVIDIA TrueHDR SDK accepts 8bit SDR input; rejecting implicit 10/12/16bit -> 8bit conversion. Use Original mode.')
     w, h = video['width'], video['height']
-    if w % 2 or h % 2:
+    if not (0<w<=16384 and 0<h<=16384) or w % 2 or h % 2:
         raise ValueError('Main10 yuv420 output requires even input dimensions')
     # No resize, fps filter, tone mapper, or HDR lift in this input conversion.
     transfer = {'gamma22': 'bt470m', 'gamma28': 'bt470bg',

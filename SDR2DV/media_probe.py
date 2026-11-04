@@ -17,8 +17,8 @@ def frame_rate(stream):
     for key in ('avg_frame_rate','r_frame_rate'):
         try:
             value=float(Fraction(stream.get(key,'0/0')))
-            if value>0:return value
-        except (ValueError,ZeroDivisionError):pass
+            if math.isfinite(value) and 0<value<=1000:return value
+        except (ValueError,ZeroDivisionError,OverflowError,TypeError):pass
     return 0
 
 
@@ -68,11 +68,14 @@ def check_timing(path,stream,ffprobe='ffprobe'):
     count=0;first=None
     for line in stream_lines(command):
         value=number(compact_fields(line).get('best_effort_timestamp_time'))
-        if value is None:continue
+        if value is None:
+            if 'best_effort_timestamp_time' in compact_fields(line):raise ValueError('Missing/invalid frame PTS')
+            continue
         if first is None:first=value
         if abs(first)>.001:raise ValueError('Nonzero video start PTS requires explicit timeline preparation; no implicit timestamp rewrite')
         if abs(value-count/fps)>max(.0005,.02/fps):raise ValueError('Variable/discontinuous frame timestamps cannot be preserved by raw HEVC muxing; no implicit frame duplication/drop')
         count+=1
+        if count>2147483647:raise ValueError('Frame count exceeds supported RPU/PowerShell range')
     if not count:raise ValueError('No decoded source frames')
     return dict(frames=count,duration_seconds=count/fps,fps=fps)
 

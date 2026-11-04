@@ -1,3 +1,4 @@
+-c tui-constraints.txt
 rich==15.0.0
 questionary==2.1.1
 numpy==2.4.6

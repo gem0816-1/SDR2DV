@@ -20,5 +20,10 @@ class TrueHDRInputTests(unittest.TestCase):
             dict(sample_aspect_ratio='4:3'),dict(side_data_list=[dict(rotation=90)])):
             with self.assertRaises(ValueError):source_video_filter({**self.video(),**changes})
 
+    def test_invalid_frame_geometry_and_interlacing_are_rejected(self):
+        for changes in (dict(width=0),dict(width=-2),dict(height=0),dict(width=20000),
+                        dict(field_order='tt'),dict(disposition={'attached_pic':1})):
+            with self.assertRaises(ValueError):source_video_filter({**self.video(),**changes})
+
 
 if __name__=='__main__':unittest.main()

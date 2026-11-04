@@ -136,14 +136,15 @@ class ConversionConfig:
         return args
 
 
-def planned_outputs(config):
+def planned_outputs(config,description=None):
     """Display the core's existing filenames, without creating or probing media."""
     source = Path(normalize_path(config.input_path))
     folder = Path(normalize_path(config.output_dir)) if config.output_dir else source.parent
     tone = ''
     if config.hdr_mode == 'TrueHDR' and config.brightness_strength > 0:
         tone = {'Reference': '_Ref', 'Natural': '_Natural', 'realDolby': '_realDolby'}.get(config.mapping, '')
-    prefix = source.stem + ('_TrueHDR' + tone if config.hdr_mode == 'TrueHDR' else '')
+    base=(description or {}).get('output_base_name') or source.stem
+    prefix = base + ('_TrueHDR' + tone if config.hdr_mode == 'TrueHDR' else '')
     extensions = ('mp4', 'mkv') if config.container == 'both' else (config.container,)
     paths = [folder / (prefix + '_DV' + config.profile.replace('.', '') + '.' + ext) for ext in extensions]
     if config.hdr10: paths.append(folder / (prefix + '_HDR10.mp4'))

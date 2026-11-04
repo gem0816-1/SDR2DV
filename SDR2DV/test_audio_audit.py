@@ -83,6 +83,10 @@ class AudioIntegrationTests(unittest.TestCase):
         out=self.directory/'changed.mp4'
         self.run_ffmpeg('-i',str(self.source),'-af','volume=0.5','-c:a','alac','-bits_per_raw_sample','24',str(out))
         with self.assertRaisesRegex(ValueError,'samples differ'):compare(self.source,out)
+        with self.assertRaisesRegex(ValueError,'samples differ'):compare(self.source,out,allow_lossy=True)
+        copied=self.directory/'changed-copy.wav'
+        self.run_ffmpeg('-i',str(self.source),'-af','volume=0.5','-c:a','pcm_s24le',str(copied))
+        with self.assertRaisesRegex(ValueError,'samples differ'):compare(self.source,copied,allow_lossy=True)
         self.run_ffmpeg('-i',str(self.source),'-t','0.9','-c:a','alac','-bits_per_raw_sample','24',str(out))
         with self.assertRaisesRegex(ValueError,'samples differ'):compare(self.source,out)
 

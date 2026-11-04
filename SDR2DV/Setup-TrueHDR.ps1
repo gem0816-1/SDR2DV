@@ -15,11 +15,11 @@ try {
         else { & py -3.11 -m venv (Join-Path $PSScriptRoot '.venv-truehdr') }
         if ($LASTEXITCODE -ne 0) { throw 'Could not create Python 3.11 virtual environment.' }
     }
-    $packageProbe = "import importlib.metadata as m, sys; required={'nvidia-vfx':'0.2.0.0','numpy':'2.4.6','cupy-cuda12x':'14.2.0'}; sys.exit(0 if sys.version_info[:2] == (3, 11) and all(m.version(k)==v for k,v in required.items()) else 1)"
+    $packageProbe = "import importlib.metadata as m,sys; from pathlib import Path; required=dict(x.strip().split('==') for x in Path(sys.argv[1]).read_text().splitlines() if x.strip() and not x.startswith('#')); required.update({'nvidia-vfx':'0.2.0.0','numpy':'2.4.6','cupy-cuda12x':'14.2.0'}); sys.exit(0 if sys.version_info[:2] == (3, 11) and all(m.version(k)==v for k,v in required.items()) else 1)"
     $savedPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $null = & $venvPython -B -c $packageProbe 2>&1
+        $null = & $venvPython -B -c $packageProbe (Join-Path $PSScriptRoot 'truehdr-constraints.txt') 2>&1
         $packagesReady = ($LASTEXITCODE -eq 0)
     }
     finally { $ErrorActionPreference = $savedPreference }
@@ -36,7 +36,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Python dependency check failed.' }
     & $venvPython -B (Join-Path $PSScriptRoot 'brightness_mapping.py') --describe
     if ($LASTEXITCODE -ne 0) { throw 'Reference brightness/skin correction module check failed.' }
-    & $venvPython -B (Join-Path $PSScriptRoot 'truehdr_backend.py') --check
-    if ($LASTEXITCODE -ne 0) { throw 'TrueHDR inference check failed. See the original SDK error above.' }
+    . (Join-Path $PSScriptRoot 'reliability.ps1')
+    $gpuLock=Enter-GpuTaskLock
+    try {
+        & $venvPython -B (Join-Path $PSScriptRoot 'truehdr_backend.py') --check
+        if ($LASTEXITCODE -ne 0) { throw 'TrueHDR inference check failed. See the original SDK error above.' }
+    } finally {$gpuLock.ReleaseMutex();$gpuLock.Dispose()}
 }
 catch { Write-Error $_; exit 1 }

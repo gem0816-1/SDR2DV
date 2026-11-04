@@ -30,7 +30,7 @@ def decoded_samples(path,index,source_stream,ffmpeg='ffmpeg',progress_path=None,
     digest=hashlib.sha256()
     rate=int(source_stream['sample_rate'])
     channels=int(source_stream['channels'])
-    command=[ffmpeg,'-v','error','-nostdin','-ss','0','-i',str(path),'-map',f'0:a:{index}',
+    command=[ffmpeg,'-v','error','-xerror','-nostdin','-err_detect','explode','-ss','0','-i',str(path),'-map',f'0:a:{index}',
              '-vn','-sn','-dn','-c:a',codec,'-f',raw_format,'pipe:1']
     with tempfile.TemporaryFile() as errors:
         child=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=errors,creationflags=CREATE_FLAGS)
@@ -75,13 +75,15 @@ def compare(source,target,ffmpeg='ffmpeg',ffprobe='ffprobe',progress_path=None,a
     if len(original)!=len(output):raise ValueError('Audio track count changed')
     sv=next((s for s in src['streams'] if s['codec_type']=='video'),{})
     tv=next((s for s in dst['streams'] if s['codec_type']=='video'),{})
-    results=[]
+    results=[];any_lossy=False
     for index,(a,b) in enumerate(zip(original,output)):
         for field in ('sample_rate','channels'):
             if str(a.get(field))!=str(b.get(field)):raise ValueError(f'Audio {index+1}: {field} changed')
         if layout(a)!=layout(b):raise ValueError(f'Audio {index+1}: channel layout changed')
         copied=a['codec_name']==b['codec_name']
         alac=b['codec_name']=='alac' and a['codec_name']!=b['codec_name']
+        track_lossy=allow_lossy and not copied and not alac
+        any_lossy=any_lossy or track_lossy
         if not copied and not alac and not allow_lossy:raise ValueError('Unexpected lossy audio conversion')
         if alac and effective_bits(a)!=effective_bits(b):raise ValueError('ALAC effective bit depth changed')
         source_offset=number(a.get('start_time'),0)-number(sv.get('start_time'),0)
@@ -94,8 +96,8 @@ def compare(source,target,ffmpeg='ffmpeg',ffprobe='ffprobe',progress_path=None,a
         source_pcm=decoded_samples(source,index,a,ffmpeg,progress_path)
         target_pcm=decoded_samples(target,index,a,ffmpeg,progress_path,source_pcm['duration_seconds'])
         exact=source_pcm==target_pcm
-        if not exact and not allow_lossy:raise ValueError(f'Audio {index+1}: decoded samples differ or samples were lost/repeated')
-        if allow_lossy and abs(target_pcm['duration_seconds']-source_pcm['duration_seconds'])>.01:
+        if not exact and not track_lossy:raise ValueError(f'Audio {index+1}: decoded samples differ or samples were lost/repeated')
+        if track_lossy and abs(target_pcm['duration_seconds']-source_pcm['duration_seconds'])>.01:
             raise ValueError('Explicit lossy audio duration changed by more than 10ms')
         packets_equal=None
         if copied:
@@ -112,7 +114,7 @@ def compare(source,target,ffmpeg='ffmpeg',ffprobe='ffprobe',progress_path=None,a
             packet_note='载荷相同' if packets_equal else ('重新编码；压缩包不要求相同' if not copied else '封装/预滚包可能改变；以采样与时间检查共同判断')))
     descriptors=validate_entries(target,output)
     return dict(source=str(Path(source).resolve()),output=str(Path(target).resolve()),
-                verification='parameters_passed_explicit_lossy' if allow_lossy else 'passed',tracks=results,
+                verification='parameters_passed_explicit_lossy' if any_lossy else 'passed',tracks=results,
                 source_mp4_sample_entries=source_descriptors,mp4_sample_entries=descriptors,platform_audio_verified=False)
 
 

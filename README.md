@@ -7,6 +7,7 @@ Windows 下将 SDR 转为 Dolby Vision 8.4 / HLG 或 8.1 / PQ，输出 MP4 / MKV
 
 需要 Windows 10/11 x64、64 位 PowerShell 5.1 或 7，首次部署需要网络。
 下载并解压 [Windows 发布包](https://github.com/gem0816-1/SDR2DV/releases/latest)，或克隆源码，然后运行部署。
+本轮可靠性修复目前仅在 `main` 源码中；v2.1.0 发布包尚未更新。
 
 ```powershell
 .\deploy.bat
@@ -41,6 +42,7 @@ MP4 默认复制兼容音轨；受支持的整数 PCM 无损转 ALAC，并核对
 `-BitrateMode Platform` 显式使用平台兼容码率；`-BitrateMode Quality -NvencCq 18` 使用质量模式。
 `-OutputDir` 指定目录，`-Force` 覆盖，`-KeepTemp` 保留本次缓存；默认清理本次中间媒体。
 参数、TUI 和排错见 [使用说明](docs/usage.md)，审计与测试边界见 [验证说明](docs/validation.md)。
+可靠性交付、取消后恢复和并发限制见 [可靠性审查](docs/reliability-audit.md)。
 
 ## 限制
 

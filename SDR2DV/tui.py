@@ -56,7 +56,7 @@ def summary(config,caps,description):
         ('输出',config.container.upper()+(' + HDR10/PQ 对照' if config.hdr10 else '')),('输出目录',config.output_dir or '与输入相同'),
         ('中间文件','保留本次临时文件' if config.keep_temp else '正常结束/取消后清理本次媒体缓存'),('覆盖已有成片','是' if config.force else '否，跳过')]
     for label,value in values:table.add_row(label,Text(str(value),overflow='fold'))
-    for path in planned_outputs(config):
+    for path in planned_outputs(config,description):
         status='（已存在，将覆盖）' if config.force else ('（已存在：需换目录或允许覆盖）' if path.name.endswith('_HDR10.mp4') else '（已存在，将跳过，旧文件不会改变）')
         table.add_row('成片路径',Text(str(path)+(status if path.exists() else ''),overflow='fold'))
     target=rate
@@ -108,6 +108,11 @@ def render_conversion(task):
                         speed=f'{data.get("fps",0):.2f} fps  {data.get("speed","")}'
                     elif kind in ('log','error'):
                         logs.append(str(data.get('message',data.get('text',data))))
+                logs=logs[-200:]
+                if task.last_event_error:
+                    stage='界面事件读取异常；转换核心仍在运行，请查看 console.log'
+                    task.last_event_error=None
+                    progress.update(item,description=stage)
                 if os.name=='nt':
                     import msvcrt
                     if msvcrt.kbhit():
@@ -127,13 +132,20 @@ def render_conversion(task):
         return 130
     finally:task.close()
     if task.process.returncode:
-        output=(task.directory/'console.log').read_text(encoding='utf-8-sig',errors='replace')
+        from stream_diagnostics import log_tail
+        output=log_tail(task.directory/'console.log',65536)
         console.print(Panel(Text(output[-16000:]),title='转换失败 · 完整日志见下方路径',border_style='red'))
     elif task.report.exists():
-        result=json.loads(task.report.read_text(encoding='utf-8-sig'))
-        if not any(file.get('outputs') for file in result.get('results',[])):
+        try:
+            result=json.loads(task.report.read_text(encoding='utf-8-sig'))
+            if not isinstance(result,dict):raise ValueError('报告不是 JSON 对象')
+        except (OSError,ValueError) as error:
+            console.print(Text(f'转换核心已结束；报告无法读取：{error}\n请检查：{task.directory}',style='yellow'))
+            return task.process.returncode
+        if not any(file.get('outputs') or file.get('hdr10_outputs') for file in result.get('results',[])):
             console.print('[yellow]本次未生成新成片；检查上方“已存在/跳过”提示，旧文件的码率不会改变。[/yellow]')
         for file in result.get('results',[]):
+            for hdr10 in file.get('hdr10_outputs',[]):console.print(Text('HDR10 对照：'+hdr10))
             for out in file.get('outputs',[]):
                 deviation=out.get('deviation_percent')
                 target=f'{file["target_video_bps"]/1e6:.3f}' if file.get('target_video_bps') else '不设'

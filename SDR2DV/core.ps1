@@ -24,10 +24,16 @@ function Get-CorePython {
 
 function Write-TaskEvent {
     param([string]$Type, [hashtable]$Data)
-    if (-not $EventPath) { return }
+    if (-not $EventPath -or ($script:SidecarsReady -is [bool] -and -not $script:SidecarsReady)) { return }
     $record = @{ type=$Type; timestamp=[DateTime]::UtcNow.ToString('o'); data=$Data }
-    [IO.File]::AppendAllText([IO.Path]::GetFullPath($EventPath),
-        (($record | ConvertTo-Json -Depth 12 -Compress) + "`n"), (New-Object Text.UTF8Encoding($false)))
+    try {
+        [IO.File]::AppendAllText([IO.Path]::GetFullPath($EventPath),
+            (($record | ConvertTo-Json -Depth 12 -Compress) + "`n"), (New-Object Text.UTF8Encoding($false)))
+    } catch {
+        # Optional UI telemetry must never turn a validated conversion into a
+        # failure, nor recursively call Write-Log/Write-TaskEvent on failure.
+        if (-not $script:EventWriteWarning) { Write-Warning ('界面事件日志不可写，转换继续：'+$_.Exception.Message);$script:EventWriteWarning=$true }
+    }
 }
 
 function Save-CoreFailureDiagnostics {
@@ -116,7 +122,7 @@ function Test-CoreAudio {
     param([hashtable]$Info,[string]$Path,[string]$WorkDir)
     $resultPath = Join-Path $WorkDir ('audio_' + [guid]::NewGuid().ToString('N') + '.json')
     $arguments = @($Info.Path,$Path,'--ffmpeg',$script:Ffmpeg,'--ffprobe',$script:Ffprobe,'--output',$resultPath)
-    if ($Mp4AudioCodec -in @('eac3','ac3')) { $arguments += '--allow-lossy' }
+    if ($Mp4AudioCodec -in @('eac3','ac3') -and [IO.Path]::GetExtension($Path) -ieq '.mp4') { $arguments += '--allow-lossy' }
     Invoke-CoreHelper -Module 'audio_audit.py' -Arguments $arguments -WorkDir $WorkDir -Label '音频完整性校验' -Duration (2*$Info.Duration)
     $result = Get-Content -LiteralPath $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($result.verification -eq 'passed') { Write-Log ('音频验证通过：{0} 条；采样值、采样数与音画偏移已检查；平台播放未验证。' -f @($result.tracks).Count) 'OK' }
@@ -146,6 +152,9 @@ function Get-FinalHdrAnalysis {
 }
 
 function Get-CoreCapabilities {
+    $probeLock=$null;$gpuBusy=''
+    try { $probeLock=Enter-GpuTaskLock } catch { $gpuBusy=$_.Exception.Message }
+    try {
     $ffmpeg = Get-ConfiguredTool 'ffmpeg'
     if (-not $ffmpeg) { $command=Get-Command ffmpeg -ErrorAction SilentlyContinue; if ($command) { $ffmpeg=$command.Source } }
     $ffprobe = Get-ConfiguredTool 'ffprobe'
@@ -156,7 +165,7 @@ function Get-CoreCapabilities {
     if ($TrueHDRPython) { $sdkPython=$TrueHDRPython }
     if (-not $sdkPython) { $sdkPython=Join-Path $PSScriptRoot '.venv-truehdr\Scripts\python.exe' }
     $ready=$false; $sdkError='TrueHDR 环境未部署'
-    if (Test-Path -LiteralPath $sdkPython -PathType Leaf) {
+    if (-not $gpuBusy -and (Test-Path -LiteralPath $sdkPython -PathType Leaf)) {
         $preference=$ErrorActionPreference
         try {
             $ErrorActionPreference='Continue'
@@ -166,11 +175,14 @@ function Get-CoreCapabilities {
         } finally { $ErrorActionPreference=$preference }
     }
     $nvenc=@{Ready=$false;Error='FFmpeg 未就绪'}
+    if ($gpuBusy) {$sdkError=$gpuBusy;$nvenc.Error=$gpuBusy}
     $nvencLossless=$nvenc
     $x265=$false
     if ($ffmpeg) {
-        $nvenc=Test-NvencSupport -Ffmpeg $ffmpeg
-        if ($nvenc.Ready) { $nvencLossless=Test-NvencSupport -Ffmpeg $ffmpeg -IncludeLossless }
+        if (-not $gpuBusy) {
+            $nvenc=Test-NvencSupport -Ffmpeg $ffmpeg
+            if ($nvenc.Ready) { $nvencLossless=Test-NvencSupport -Ffmpeg $ffmpeg -IncludeLossless }
+        }
         $encoderText=& $ffmpeg -hide_banner -encoders 2>&1
         $x265=(($encoderText -join "`n") -match '\blibx265\b')
     }
@@ -181,5 +193,6 @@ function Get-CoreCapabilities {
         nvenc_lossless_ready=$nvencLossless.Ready; nvenc_lossless_error=$nvencLossless.Error;
         mappings=@('Neutral','Natural','Reference','realDolby'); natural_status=$script:Defaults.natural_status;
         realdolby_status='paired_reference_user_visual_accepted';
-        bitrate_modes=@('Source','Platform','Custom','Quality'); profiles=@('8.4'); peak_nits=1000 }
+        bitrate_modes=@('Source','Platform','Custom','Quality'); profiles=@('8.4'); peak_nits=1000;gpu_busy_error=$gpuBusy }
+    } finally {if ($probeLock) {$probeLock.ReleaseMutex();$probeLock.Dispose()}}
 }

@@ -1,0 +1,6 @@
+# Windows x64 / Python 3.11; transitive versions exercised by this project.
+markdown-it-py==4.2.0
+mdurl==0.1.2
+prompt_toolkit==3.0.53
+Pygments==2.21.0
+wcwidth==0.9.4

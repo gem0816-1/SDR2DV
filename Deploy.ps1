@@ -20,11 +20,19 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'scripts\deploy-common.ps1')
+. (Join-Path $PSScriptRoot 'SDR2DV\reliability.ps1')
 $toolsDirectory = Join-Path $PSScriptRoot '.tools'
 $configPath = Join-Path $toolsDirectory 'tools.json'
 if (-not $CacheDirectory) { $CacheDirectory = Join-Path $toolsDirectory 'downloads' }
 $assets = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'scripts\deploy-assets.json') -Raw | ConvertFrom-Json
 try {
+    $algorithm=[Security.Cryptography.SHA256]::Create()
+    try {$key=[BitConverter]::ToString($algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($PSScriptRoot).ToUpperInvariant()))).Replace('-','')}
+    finally {$algorithm.Dispose()}
+    $deploymentLock=New-Object Threading.Mutex($false,('Global\SDR2DV_DEPLOY_'+$key))
+    $deploymentOwned=$false
+    try {$deploymentOwned=$deploymentLock.WaitOne(0)} catch [Threading.AbandonedMutexException] {$deploymentOwned=$true}
+    if (-not $deploymentOwned) {throw 'Another deployment is using this project environment. Wait and retry.'}
     if (-not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
         throw 'This deployment package requires Windows x64 and 64-bit PowerShell.'
     }
@@ -123,9 +131,14 @@ try {
     if (-not $CheckOnly) {
         New-Item -ItemType Directory -Path $toolsDirectory -Force | Out-Null
         $config = [ordered]@{ schema = 1; truehdr_ready = $enableTrueHDR; tools = $resolved }
-        [IO.File]::WriteAllText($configPath, ($config | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+        $staging=$configPath+'.'+[guid]::NewGuid().ToString('N')+'.partial'
+        try {
+            [IO.File]::WriteAllText($staging, ($config | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+            if ([IO.File]::Exists($configPath)) {[Sdr2dv.Native]::ReplaceJournal($staging,$configPath)} else {[IO.File]::Move($staging,$configPath)}
+        } finally {if ([IO.File]::Exists($staging)) {[IO.File]::Delete($staging)}}
     }
     Write-Host 'Ready. Drag a video onto an SDR2DV batch entrypoint to convert.'
     if (-not $enableTrueHDR) { Write-Host 'Standard mode ready; TrueHDR was not configured. Use -Mode TrueHDR to configure it.' }
 }
 catch { Write-Host ('Deployment failed: {0}' -f $_.Exception.Message) -ForegroundColor Red; exit 1 }
+finally {if ($deploymentOwned) {$deploymentLock.ReleaseMutex()};if ($deploymentLock) {$deploymentLock.Dispose()}}
