@@ -191,7 +191,7 @@ function Get-CoreCapabilities {
         truehdr_ready=$ready; truehdr_error=$sdkError; truehdr_python=$sdkPython;
         nvenc_ready=$nvenc.Ready; nvenc_error=$nvenc.Error; x265_ready=$x265;
         nvenc_lossless_ready=$nvencLossless.Ready; nvenc_lossless_error=$nvencLossless.Error;
-        mappings=@('Neutral','Natural','Reference','realDolby'); natural_status=$script:Defaults.natural_status;
+        mappings=@('Neutral','Natural','Reference','realDolby','UltraHDR'); natural_status=$script:Defaults.natural_status;
         realdolby_status='paired_reference_user_visual_accepted';
         bitrate_modes=@('Source','Platform','Custom','Quality'); profiles=@('8.4'); peak_nits=1000;gpu_busy_error=$gpuBusy }
     } finally {if ($probeLock) {$probeLock.ReleaseMutex();$probeLock.Dispose()}}

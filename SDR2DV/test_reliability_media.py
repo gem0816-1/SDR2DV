@@ -21,7 +21,8 @@ class ActualReliabilityMediaTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(prefix='SDR2DV_media_reliability_')
         self.root=Path(self.temp.name)/'中文 [目录] & QA';self.root.mkdir()
         self.scratch=Path(self.temp.name)/'scratch'
-        self.evidence=ROOT/'validation/reliability_20261104'/('ps51' if Path(SHELL).name.lower()=='powershell.exe' else 'ps7')/self._testMethodName
+        evidence_root = Path(os.environ.get('SDR2DV_TEST_EVIDENCE', ROOT/'validation/reliability_20261104'))
+        self.evidence = evidence_root/('ps51' if Path(SHELL).name.lower()=='powershell.exe' else 'ps7')/self._testMethodName
         self.evidence.mkdir(parents=True,exist_ok=True)
         self.addCleanup(self.temp.cleanup)
         self.scratch.mkdir()
@@ -134,6 +135,10 @@ class ActualReliabilityMediaTests(unittest.TestCase):
         _,reused=self.convert(source,'reuse',['-HdrMode','TrueHDR','-Bilibili','-Encoder','NVENC',
             '-TrueHDRCache',str(work),'-KeepHDR10'])
         self.assertEqual(reused['results'][0]['delivery'],'committed')
+        _, rejected = self.convert(source, 'neutral-cache-for-ultrahdr', [
+            '-HdrMode', 'TrueHDR', '-Bilibili', '-Encoder', 'NVENC', '-BrightnessMapping', 'UltraHDR',
+            '-TrueHDRCache', str(work)], expected=1)
+        self.assertIn('复用匹配的 UltraHDR 缓存', rejected['results'][0]['error'])
         self.assertTrue((work/'truehdr_hlg.mkv').exists())
         # Test-owned kept cache only. Its exact manifest names this generated
         # fixture. Never inspect/delete any pre-existing user cache directory.
@@ -141,6 +146,30 @@ class ActualReliabilityMediaTests(unittest.TestCase):
         self.assertEqual(work.parent.resolve(),self.scratch/'SDR2DV')
         # All cache files belong to this test's TemporaryDirectory, removed by
         # its context cleanup; no shared production Temp path is cleaned.
+
+    @unittest.skipUnless(os.environ.get('SDR2DV_TEST_NVENC')=='1', 'NVIDIA TrueHDR/NVENC run explicitly enabled')
+    def test_ultrahdr_mp4_mkv_hdr10_and_matching_cache(self):
+        source = self.fixture()
+        args = ['-HdrMode', 'TrueHDR', '-Bilibili', '-Encoder', 'NVENC', '-BrightnessMapping', 'UltraHDR']
+        _, result = self.convert(source, 'ultrahdr', [*args, '-Format', 'both', '-KeepHDR10', '-KeepTemp'])
+        record = result['results'][0]
+        self.assertEqual(record['delivery'], 'committed')
+        self.assertEqual(record['hdr']['brightness_profile']['profile_id'], 'UltraHDR-v1')
+        self.assertFalse(record['hdr']['reference_headroom'])
+        self.assertEqual({Path(row['path']).name for row in record['outputs']},
+                         {source.stem+'_TrueHDR_UltraHDR_DV84.mp4', source.stem+'_TrueHDR_UltraHDR_DV84.mkv'})
+        self.assertEqual(Path(record['hdr10_outputs'][0]).name, source.stem+'_TrueHDR_UltraHDR_HDR10.mp4')
+        for row in record['outputs']:
+            self.assertEqual(row['frames'], 25)
+            self.assertTrue(row['audio']['tracks'][0]['decoded_samples_identical'])
+        events = [json.loads(line) for line in self.last_event_path.read_text(encoding='utf-8-sig').splitlines()]
+        work = Path(next(e['data']['path'] for e in events if e['type']=='workspace'))
+        manifest = json.loads((work/'truehdr-report.json').read_text(encoding='utf-8'))
+        self.assertEqual(manifest['brightness_mapping'], record['hdr']['brightness_profile'])
+        _, reused = self.convert(source, 'ultrahdr-reuse', [*args, '-TrueHDRCache', str(work), '-KeepHDR10'])
+        self.assertEqual(reused['results'][0]['delivery'], 'committed')
+        events = [json.loads(line) for line in self.last_event_path.read_text(encoding='utf-8-sig').splitlines()]
+        self.assertFalse(any(e['type']=='stage' and e['data'].get('stage')=='TrueHDR/HLG' for e in events))
 
     @unittest.skipUnless(os.environ.get('SDR2DV_TEST_NVENC')=='1','NVIDIA conversion through actual TUI bridge explicitly enabled')
     def test_tui_bridge_conversion_with_nested_owned_windows_jobs(self):

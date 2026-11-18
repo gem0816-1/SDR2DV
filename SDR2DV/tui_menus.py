@@ -15,7 +15,8 @@ def mapping_label(config):
     if config.hdr_mode != 'TrueHDR': return '标准 SDR 上变换'
     if config.mapping == 'Neutral' or config.brightness_strength == 0:
         return 'Neutral（旁路额外调色）'
-    return f'{config.mapping} · 曲线 {config.brightness_strength:g} · 肤色 {config.skin_strength:g}'
+    preset = 'UltraHDR（增益图风格）' if config.mapping == 'UltraHDR' else config.mapping
+    return f'{preset} · 调色强度 {config.brightness_strength:g} · 肤色 {config.skin_strength:g}'
 
 
 def main_options(config):
@@ -47,9 +48,9 @@ def advanced_options(config, caps):
         Option('quality', f'画质数值 · {"CQ " + str(config.nvenc_cq) if encoder == "NVENC" else "CRF " + str(config.crf)}',
                '正数越小通常文件越大；CQ 的 0 为自动。CQ 和 CRF 不可直接比较。',
                None if quality else '先选择“质量优先”并关闭无损；码率模式不使用此值'),
-        Option('strength', f'亮度曲线强度 · {config.brightness_strength:g}',
-               '0 旁路额外调色；1 完整应用；realDolby 允许超过 1000 nit 的参考高光。',
-               None if grading else '仅 TrueHDR 的 Natural / Reference / realDolby 使用'),
+        Option('strength', f'亮度预设强度 · {config.brightness_strength:g}',
+               '0 使用 TrueHDR 原始效果，1 完整应用所选预设，中间值混合两者。',
+               None if grading else '请选择 TrueHDR 的亮度预设（Neutral 以外）'),
         Option('skin', f'暖色肤色去黄 · {config.skin_strength:g}',
                '0 保留原色；越大去黄越强，也可能影响相近颜色的灯光。',
                None if grading and config.brightness_strength > 0 else '需启用调色曲线且强度大于 0'),
@@ -115,8 +116,8 @@ def configure_advanced(config, caps):
                 '只在质量优先模式生效；填 0 不等于开启无损。', integer=True)
         elif action == 'strength':
             field = 'brightness_strength'
-            value = number('曲线强度（0～1）', config.brightness_strength, 0, 1,
-                '0 关闭曲线和肤色修正；0.5 混合原始与映射效果；1 完整应用。realDolby 不按 1000 nit 限峰。')
+            value = number('预设强度（0～1）', config.brightness_strength, 0, 1,
+                '0 使用 TrueHDR 原始效果，0.5 混合两者，1 完整应用预设。0 时也关闭肤色修正。')
         elif action == 'skin':
             field = 'skin_strength'
             value = number('暖色去黄强度（0～1）', config.skin_strength, 0, 1,
@@ -177,8 +178,10 @@ def configure(config, caps, description, summary, console):
             details = {'Neutral': '默认：保留 TrueHDR 的亮度和颜色，不叠加本工具的曲线或肤色修正。',
                        'Natural': '实验：保持中低亮度，柔和收住高光；仍需 HDR 设备观感确认。',
                        'Reference': '旧参考风格，可能压暗阴影/提亮中间调；默认带 0.5 去黄，仅适合对照。',
-                       'realDolby': '按配对苹果视频校准：收回偏亮的中低调、增强高光，保留 HLG 超白，不限 1000 nit；配对样片观感已获用户确认，其他素材建议先试片。'}
-            value = choose('HDR 亮度分配', [Option(name, name, detail,
+                       'realDolby': '按配对苹果视频校准：收回偏亮的中低调、增强高光，保留 HLG 超白，不限 1000 nit；配对样片观感已获用户确认，其他素材建议先试片。',
+                       'UltraHDR': '参考 Google 的增益图公式。以原片明暗和颜色为底，'
+                                   '逐像素借用 TrueHDR 高光，目标 1000 nit，输出 DV 8.4 视频。'}
+            value = choose('HDR 亮度分配', [Option(name, 'UltraHDR（增益图风格）' if name == 'UltraHDR' else name, detail,
                 None if name in caps['mappings'] else '后端未实现') for name, detail in details.items()], config.mapping)
             if value != BACK and value != config.mapping:
                 config.mapping = value; config.brightness_strength = defaults()['brightness_strength']

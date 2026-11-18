@@ -92,6 +92,14 @@ Python 读/写/预分配帧读取与 FFmpeg 原始像素管道统一限制每次
 
 2026-11-03，用户对上述8秒DV样片反馈“整体接近参考”，记为本素材主观观感通过。此次回复未提供设备型号、系统/播放器版本或杜比视界标识确认；不将其扩大为DV播放链、其他素材或平台验收。本轮仍未执行整片223.05秒的新版转换、B站投稿或平台音频回读。证据保存在本地 `validation/realdolby_20261103/`，用户对照样片在原素材目录的 `realDolby对照/`。
 
+## 2026-11-18 UltraHDR 预设验证
+
+- `UltraHDR-v1` 以原片为底，TrueHDR 提供逐像素的高光增益依据。203 nit 参考白沿用 Google 参考实现，亮部权重和 1000 nit 目标为本项目的视频设定。CPU/CUDA 用同一套公式，CUDA 合并计算以减少 4K 帧的临时内存。[Ultra HDR 规范](https://developer.android.com/media/platform/hdr-image-format)、[参考实现的白点参数](https://github.com/google/libultrahdr/blob/v1.4.0/lib/include/ultrahdr/gainmapmath.h)
+- 发布候选以 7b28ec4 为基线。默认套件 107 通过、12 跳过、1 项日志压力测试超时。单独复跑时，发布候选与原基线均在同一退出码断言失败。
+- UltraHDR 数值套件 4 项通过，含真实 CUDA 与 CPU 结果对照。PowerShell 5.1 和 7 的真实媒体套件各通过 6 项，覆盖 DV MP4、DV MKV、HDR10/PQ、音频逐样本校验、UltraHDR 缓存复用及拒绝不匹配的 Neutral 缓存。使用 FFmpeg 7.1、dovi_tool 2.3.4 和 RTX 4060 Laptop GPU。
+- 本地开发版本复用 realDolby 对照的 8 秒 SDR 片段从头推理，RTX 4060 Laptop GPU / NVENC 输出 3840×2160、60 fps、480 帧、8.000 秒的 DV 8.4 / HLG MP4。DOVI 兼容 ID 4 和 RPU 校验通过，48 kHz / 24-bit ALAC 与源 PCM 解码采样一致。为配对比较，此样片与先前 realDolby 样片使用相同的 31.338 Mbps Custom 目标，实际为 33.629 Mbps。
+- 样片主流程首轮遇到 4K 内存分配失败。合并 GPU 运算后同一输入完成转换。1000 nit 是映射目标，最终 HLG 解码实测最差单帧的 CIE Y 超过 1100 nit 像素占约 0.0018%，编码后的亮度超调保留在报告内。此次完成的是本地文件和数值验证，HDR 设备主观观感与 B站播放结果待实测。
+
 ## 标准与实现依据
 
 - [ITU-R BT.2100](https://www.itu.int/rec/R-REC-BT.2100)：PQ、HLG及参考显示模型。

@@ -19,7 +19,7 @@ import numpy as np
 from truehdr_backend import CREATE_FLAGS, consume, file_hash, read_frame, runtime, source_plan
 from pq_to_hlg import (rgb_pq_to_nits, rgb_nits_to_hlg, cuda_reference_check,
                       hlg_transport_format, hlg_transport_planes, pq_display_rgb)
-from brightness_mapping import luminance_lut, apply_mapping, mapping_info
+from brightness_mapping import MAPPING_NAMES, luminance_lut, apply_mapping, mapping_info
 from stream_diagnostics import diagnostic_streams, log_tail
 from pipe_io import CHUNK_BYTES, FrameWriteError, write_frame
 from cache_binding import new_binding
@@ -172,7 +172,7 @@ def convert(args):
                 if packed.shape != (height, width) or packed.dtype != cp.uint32:
                     raise RuntimeError('Invalid TrueHDR RGB10A2 buffer')
                 rgb_pq = cp.stack([((packed >> shift) & 1023).astype(cp.float32)/1023 for shift in (0,10,20)])
-                display = apply_mapping(cp,rgb_pq_to_nits(cp,rgb_pq),tone,tone_lut)
+                display = apply_mapping(cp,rgb_pq_to_nits(cp,rgb_pq),tone,tone_lut,sdr_rgb=gpu)
                 hlg, limited = rgb_nits_to_hlg(cp,display,preserve_headroom=tone['name']=='realdolby')
                 planes = hlg_transport_planes(cp,hlg,tone)
                 limited_count += int(limited.sum().get())
@@ -271,7 +271,7 @@ if __name__ == '__main__':
     parser.add_argument('--saturation', type=int, default=100)
     parser.add_argument('--middle-gray', type=int, default=50)
     parser.add_argument('--debanding-off', action='store_true')
-    parser.add_argument('--tone-mapping',type=str.lower,choices=['reference','neutral','natural','realdolby'],default='neutral')
+    parser.add_argument('--tone-mapping',type=str.lower,choices=MAPPING_NAMES,default='neutral')
     parser.add_argument('--tone-strength',type=float,default=1.)
     parser.add_argument('--skin-strength',type=float)
     parser.add_argument('--cache-encoder',choices=['nvenc','x265'],default='nvenc')

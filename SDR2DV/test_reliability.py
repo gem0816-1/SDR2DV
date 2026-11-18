@@ -193,6 +193,7 @@ $one=Get-InputBaseName (Get-Item -LiteralPath (Join-Path $directory 'video.mp4')
 $two=Get-InputBaseName (Get-Item -LiteralPath (Join-Path $directory 'video.mkv'))
 if ($one -eq $two -or $one -ne 'video__src_mp4' -or $two -ne 'video__src_mkv') {throw 'Input name collision'}
 if (-not (Test-GeneratedVideoName 'video_TrueHDR_realDolby_HDR10.mp4') -or (Test-GeneratedVideoName 'original.mp4')) {throw 'Batch filter failed'}
+if (-not (Test-GeneratedVideoName 'video_TrueHDR_UltraHDR_HDR10.mp4')) {throw 'UltraHDR HDR10 was treated as a source'}
 foreach ($invalid in @((('x'*256)+'.mp4'),'file.mp4:stream')) {
   $rejected=$false;try {$tx=New-OutputTransaction @(@{Path=(Join-Path $directory $invalid)}) -Overwrite;Close-OutputTransaction $tx} catch {$rejected=$true}
   if (-not $rejected) {throw 'Invalid/too-long output reached encoding'}

@@ -142,7 +142,8 @@ def planned_outputs(config,description=None):
     folder = Path(normalize_path(config.output_dir)) if config.output_dir else source.parent
     tone = ''
     if config.hdr_mode == 'TrueHDR' and config.brightness_strength > 0:
-        tone = {'Reference': '_Ref', 'Natural': '_Natural', 'realDolby': '_realDolby'}.get(config.mapping, '')
+        tone = {'Reference': '_Ref', 'Natural': '_Natural', 'realDolby': '_realDolby',
+                'UltraHDR': '_UltraHDR'}.get(config.mapping, '')
     base=(description or {}).get('output_base_name') or source.stem
     prefix = base + ('_TrueHDR' + tone if config.hdr_mode == 'TrueHDR' else '')
     extensions = ('mp4', 'mkv') if config.container == 'both' else (config.container,)

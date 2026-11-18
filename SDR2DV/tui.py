@@ -77,6 +77,9 @@ def summary(config,caps,description):
         console.print('[yellow]Natural 数值与转换测试已实现；HDR 设备观感仍待确认。默认保留 Neutral。[/yellow]')
     if config.hdr_mode=='TrueHDR' and config.mapping=='realDolby' and config.brightness_strength>0:
         console.print('[dim]realDolby 按配对参考校准并保留扩展 HLG；1000 nit 仅为测量参考。配对样片观感已获用户确认；其他素材建议先试片，创作 Trim 与丢失细节不能直接复制。[/dim]')
+    if config.hdr_mode=='TrueHDR' and config.mapping=='UltraHDR' and config.brightness_strength>0:
+        console.print('[dim]UltraHDR 用原片作为明暗和颜色的底，按像素增强高光。'
+                      '采用 Google 公开的照片增益图思路，输出 Dolby Vision 8.4 视频。[/dim]')
     console.print('[dim]SDR 高光缺失无法真实恢复；同码率不等于无损。B站 DV / Hi-Res 仍需投稿实测。[/dim]')
 
 

@@ -38,13 +38,13 @@
     Original 保留原转换；TrueHDR 使用官方 NVIDIA SDK，固定输出 P8.4，不叠加原高光曲线。
 
 .PARAMETER BrightnessMapping
-    Neutral 默认保留 SDK 直接映射；Natural 保护中低亮度；Reference 旧曲线；realDolby 按配对苹果参考校准，允许 HLG 超白，不以 1000 nit 截顶。
+    Neutral 默认保留 SDK 直接映射；Natural 保护中低亮度；Reference 旧曲线；realDolby 按配对苹果参考校准，允许 HLG 超白，不以 1000 nit 截顶。UltraHDR 按原画面应用增益图风格，目标 1000 nit。
 
 .PARAMETER BrightnessStrength
-    Natural / Reference / realDolby 曲线强度，0..1，默认 1；0 相当于 Neutral。
+    Natural / Reference / realDolby / UltraHDR 预设强度，0..1，默认 1；0 相当于 Neutral。
 
 .PARAMETER SkinToneCorrection
-    暖色肤色去黄强度，0..1；Neutral/Natural/realDolby 默认 0，显式 Reference 默认 0.5。
+    暖色肤色去黄强度，0..1；Neutral/Natural/realDolby/UltraHDR 默认 0，显式 Reference 默认 0.5。
 
 .PARAMETER KeepHDR10
     TrueHDR 模式额外保留独立 HDR10/PQ MP4，音轨遵循 Mp4AudioCodec 策略。
@@ -138,7 +138,7 @@ param(
 
     [switch]$TrueHDRDebandingOff,
 
-    [ValidateSet('Reference', 'Neutral', 'Natural', 'realDolby')]
+    [ValidateSet('Reference', 'Neutral', 'Natural', 'realDolby', 'UltraHDR')]
     [string]$BrightnessMapping = 'Neutral',
 
     [ValidateRange(0.0, 1.0)]
@@ -1043,6 +1043,7 @@ function Convert-SingleFile {
         if ($BrightnessMapping -eq 'Reference' -and $BrightnessStrength -gt 0) { $suffix = '_Ref' + $suffix }
         elseif ($BrightnessMapping -eq 'Natural' -and $BrightnessStrength -gt 0) { $suffix = '_Natural' + $suffix }
         elseif ($BrightnessMapping -eq 'realDolby' -and $BrightnessStrength -gt 0) { $suffix = '_realDolby' + $suffix }
+        elseif ($BrightnessMapping -eq 'UltraHDR' -and $BrightnessStrength -gt 0) { $suffix = '_UltraHDR' + $suffix }
         $suffix = '_TrueHDR' + $suffix
     }
     if ($Format -eq 'mp4' -or $Format -eq 'both') {
@@ -1056,6 +1057,7 @@ function Convert-SingleFile {
     if ($BrightnessMapping -eq 'Reference' -and $BrightnessStrength -gt 0) {$hdr10Suffix='_TrueHDR_Ref_HDR10.mp4'}
     elseif ($BrightnessMapping -eq 'Natural' -and $BrightnessStrength -gt 0) {$hdr10Suffix='_TrueHDR_Natural_HDR10.mp4'}
     elseif ($BrightnessMapping -eq 'realDolby' -and $BrightnessStrength -gt 0) {$hdr10Suffix='_TrueHDR_realDolby_HDR10.mp4'}
+    elseif ($BrightnessMapping -eq 'UltraHDR' -and $BrightnessStrength -gt 0) {$hdr10Suffix='_TrueHDR_UltraHDR_HDR10.mp4'}
     if ($KeepHDR10) { $outputs+=@{Kind='hdr10';Path=(Join-Path $targetDir ($baseName+$hdr10Suffix))} }
     $tx=New-OutputTransaction -Outputs $outputs -Overwrite:$Force
     $cacheHandles=@()
@@ -1071,8 +1073,8 @@ function Convert-SingleFile {
     }
     $pending=@($tx.Pending | Where-Object {$_.Kind -ne 'hdr10'})
     $deliveries=@()
-    $publishHDR10=(@($tx.Pending | Where-Object {$_.Kind -eq 'hdr10'}).Count -gt 0)
-    $KeepHDR10=$publishHDR10
+    $hdr10Delivery = $tx.Pending | Where-Object { $_.Kind -eq 'hdr10' } | Select-Object -First 1
+    $KeepHDR10 = $null -ne $hdr10Delivery
     Assert-TaskDiskSpace @($targetDir,$script:WorkRoot)
     Write-Log ('处理：{0}' -f $sourceItem.Name) 'STEP'
 
@@ -1165,17 +1167,13 @@ function Convert-SingleFile {
             $toneStrength = $BrightnessStrength.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
             $skinStrength = $SkinToneCorrection.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
             $toneInfo = $null
-            $hdr10Suffix = '_TrueHDR_HDR10.mp4'
-            if ($toneName -eq 'reference') { $hdr10Suffix = '_TrueHDR_Ref_HDR10.mp4' }
-            elseif ($toneName -eq 'natural') { $hdr10Suffix = '_TrueHDR_Natural_HDR10.mp4' }
-            elseif ($toneName -eq 'realdolby') { $hdr10Suffix = '_TrueHDR_realDolby_HDR10.mp4' }
             if ($toneName -ne 'neutral') {
                 $mappingText = & $script:TrueHDRPython -B (Join-Path $PSScriptRoot 'brightness_mapping.py') --describe --mode $toneName --strength $toneStrength --skin-strength $skinStrength
                 if ($LASTEXITCODE -ne 0) { throw '无法读取参考亮度曲线配置。' }
                 $toneInfo = ($mappingText -join "`n") | ConvertFrom-Json
             }
             if ($KeepHDR10) {
-                $hdr10Target = Join-Path $targetDir ($baseName + $hdr10Suffix)
+                $hdr10Target = $hdr10Delivery.Path
                 if ((Test-Path -LiteralPath $hdr10Target) -and -not $Force) { throw "HDR10 输出已存在：$hdr10Target" }
             }
             $backendArgs = @('--input', $sourceItem.FullName, '--output', $hlgSource,
@@ -1199,6 +1197,11 @@ function Convert-SingleFile {
                 Write-Log '核验已完成的 TrueHDR 缓存（源 SHA256、媒体 SHA256、全部 SDK 参数）…'
                 $cacheText=Invoke-NativeQuiet -Exe $script:TrueHDRPython -Arguments $cacheArgs -What 'TrueHDR 缓存校验' -Capture
                 $cacheInfo = ($cacheText -join "`n") | ConvertFrom-Json
+                if ($toneName -eq 'ultrahdr' -and ($cacheInfo.kind -ne 'hlg-yuv420p10-lossless-v1' -or
+                    $cacheInfo.cache_binding_status -ne 'media_and_configuration_sha256' -or
+                    $cacheInfo.brightness_mapping.name -ne 'ultrahdr')) {
+                    throw 'UltraHDR 需要原 SDR 与 TrueHDR 同帧计算。请复用匹配的 UltraHDR 缓存，或从原 SDR 开始转换。'
+                }
                 if ($cacheInfo.cache_binding_status -like 'legacy*' -or $cacheInfo.kind -eq 'pq-rgb-ffv1-v1') {
                     Write-Log '旧版缓存只有媒体/源 SHA256，调色解释未绑定到媒体内部身份；本次保留兼容，建议重新生成缓存。' 'WARN'
                 }
@@ -1262,6 +1265,9 @@ function Convert-SingleFile {
                     $encodeZscale = New-ReferenceBrightnessFilter -WorkDir $workDir -Transfer hlg
                 }
             }
+            if ($toneName -eq 'ultrahdr') {
+                Write-Log ('UltraHDR 增益图风格（强度 {0}）：以原片为底，参考 TrueHDR 逐像素增强高光，目标 1000 nit。' -f $toneStrength)
+            }
             if ($toneName -eq 'reference') {
                 Write-Log ('参考亮度曲线（强度 {0}）：保留黑位、扩展中高亮、1000 nit 高光柔和收拢；全片固定曲线。' -f $toneStrength)
                 if ($SkinToneCorrection -gt 0) {
@@ -1275,7 +1281,6 @@ function Convert-SingleFile {
             else { Write-Log 'PQ→HLG：1000 nit / gamma 1.2 / 理想黑；亮度相关 OOTF，超出 HLG 色体积时等比限制 RGB。' }
             Write-Log 'TrueHDR 不叠加原模式高光曲线；最终基础层将逐帧统计并生成镜头级社区分析 RPU。'
             if ($KeepHDR10) {
-                $hdr10Target = Join-Path $targetDir ($baseName + $hdr10Suffix)
                 if ((Test-Path -LiteralPath $hdr10Target) -and -not $Force) { throw "HDR10 输出已存在：$hdr10Target" }
                 $hdr10Work = Join-Path $workDir 'HDR10.mp4'
                 $hdr10MasteringPeak = $TrueHDRLuminance
@@ -1414,6 +1419,9 @@ function Convert-SingleFile {
             max_frame_fraction_y_gt1100=$analysis.max_frame_fraction_y_gt1100;
             shots=$analysis.shots;analysis_device=$analysis.analysis_device;analysis_native_yuv_gpu=$analysis.analysis_native_yuv_gpu;
             l1_analysis_method=$analysis.l1_analysis_method;dolby_analysis_certified=$false}
+        if ($HdrMode -eq 'TrueHDR' -and $toneInfo) {
+            $fileReport.hdr.brightness_profile = $toneInfo
+        }
 
         Write-Log ('生成 Dolby Vision Profile {0} 镜头级 L1 RPU（CM v4.0 有兼容范围约束，非官方认证分析）…' -f $Profile)
         $rpu = New-DvRpu -DoviExe $script:DoviTool -FrameCount $frameCount -Stats $stats -WorkDir $workDir

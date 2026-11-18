@@ -135,5 +135,26 @@ class ExplainedMenuTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'后端尚未实现'):
             config.validate({**CAPS,'mappings':['Neutral']},require_path=False)
 
+    def test_ultrahdr_selects_its_own_preset_and_output_names(self):
+        config = ConversionConfig.initial('中文 测试.mov')
+        with patch('tui_menus.choose', side_effect=['mapping', 'UltraHDR', 'exit']) as menu:
+            with self.assertRaises(KeyboardInterrupt):
+                configure(config, CAPS, {}, None, Console(file=StringIO()))
+        options = {option.value: option for option in menu.call_args_list[1].args[1]}
+        self.assertIsNone(options['UltraHDR'].disabled)
+        self.assertIn('增益图风格', options['UltraHDR'].label)
+        self.assertIn('Google', options['UltraHDR'].detail)
+        self.assertIn('realDolby', options)
+        config.validate(CAPS, require_path=False)
+        args = config.backend_args(CAPS)
+        self.assertEqual(args[args.index('-BrightnessMapping')+1], 'UltraHDR')
+        config.container = 'both'
+        config.hdr10 = True
+        self.assertEqual([p.name for p in planned_outputs(config)], [
+            '中文 测试_TrueHDR_UltraHDR_DV84.mp4', '中文 测试_TrueHDR_UltraHDR_DV84.mkv',
+            '中文 测试_TrueHDR_UltraHDR_HDR10.mp4'])
+        config.brightness_strength = 0
+        self.assertTrue(all('_UltraHDR' not in p.name for p in planned_outputs(config)))
+
 
 if __name__=='__main__':unittest.main()

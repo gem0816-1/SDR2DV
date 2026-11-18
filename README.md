@@ -6,8 +6,7 @@ Windows 下将 SDR 转为 Dolby Vision 8.4 / HLG 或 8.1 / PQ，输出 MP4 / MKV
 ## 安装
 
 需要 Windows 10/11 x64、64 位 PowerShell 5.1 或 7，首次部署需要网络。
-下载并解压 [Windows 发布包](https://github.com/gem0816-1/SDR2DV/releases/latest)，或克隆源码，然后运行部署。
-本轮可靠性修复目前仅在 `main` 源码中；v2.1.0 发布包尚未更新。
+下载并解压 [main 源码](https://github.com/gem0816-1/SDR2DV/archive/refs/heads/main.zip)，再运行部署。使用 [v2.1.0 发布包](https://github.com/gem0816-1/SDR2DV/releases/tag/v2.1.0) 的用户可从 main 获取 UltraHDR。
 
 ```powershell
 .\deploy.bat
@@ -26,6 +25,7 @@ Windows 下将 SDR 转为 Dolby Vision 8.4 / HLG 或 8.1 / PQ，输出 MP4 / MKV
 默认：DV 8.4、BT.2020 / HLG、Main10、1000 nit 参考峰值、Neutral、源码率匹配、Auto 优先 NVENC P6。
 Natural 提供保护中低亮度的平滑高光曲线，仍待 HDR 设备观感验收，暂不默认启用。
 `realDolby` 按配对苹果视频校准明暗关系，保留 HLG 超白，不按 1000 nit 限峰；[校准与使用](docs/realDolby.md)。
+`UltraHDR` 参考 Google 照片增益图的做法，以原画面为底增强高光，输出 Dolby Vision 8.4。使用 NVIDIA TrueHDR 时可在「HDR 亮度映射」中选择。
 MP4 默认复制兼容音轨；受支持的整数 PCM 无损转 ALAC，并核对解码样本；MKV 原音复制。
 
 保留 PowerShell 非交互运行：
@@ -33,8 +33,8 @@ MP4 默认复制兼容音轨；受支持的整数 PCM 无损转 ALAC，并核对
 ```powershell
 # TrueHDR + 源视频流码率匹配
 .\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili
-# Natural 试用，并保留 HDR10/PQ 对照
-.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -BrightnessMapping Natural -KeepHDR10
+# 使用 UltraHDR，另存 HDR10/PQ 对照
+.\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -HdrMode TrueHDR -Bilibili -BrightnessMapping UltraHDR -KeepHDR10
 # 普通映射，MP4 + MKV；无需 NVIDIA
 .\SDR2DV\SDR2DV.ps1 -InputPath "D:\movie.mov" -Format both -Encoder x265
 ```

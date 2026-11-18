@@ -1,16 +1,18 @@
-"""Fixed display-light grading, including a paired Apple HLG reference preset.
+"""Display-light grading for TrueHDR, including reference and gain-map presets.
 
-This is a creative brightness preset, not reconstruction of an unavailable SDR
-master. A single monotone curve is used throughout the video: no frame-wise
-histogram matching, exposure pumping, gamma-tag changes or raised black floor.
+Presets use fixed settings across the video. UltraHDR uses both the original
+SDR pixel and the TrueHDR estimate in each frame.
 """
 import argparse
 import hashlib
 import json
+from functools import cache
 from pathlib import Path
 
 import numpy as np
-from hdr_math import display_to_hlg, hlg_eotf, pq_encode, pq_eotf
+from hdr_math import KR, KG, KB, display_to_hlg, hlg_eotf, pq_encode, pq_eotf
+
+MAPPING_NAMES = ('reference', 'neutral', 'natural', 'realdolby', 'ultrahdr')
 
 PROFILE_ID = 'reference1000-v2'
 # Display-linear luminance, cd/m2. Calibrated using 20 temporally distributed
@@ -36,15 +38,30 @@ REAL_DOLBY_ANCHORS = np.array([
 ], dtype=np.float64)
 REAL_DOLBY_SHA256 = hashlib.sha256(REAL_DOLBY_ID.encode() +
     b':extended-hlg-float32:no-auto-skin:' + REAL_DOLBY_ANCHORS.astype('<f8').tobytes()).hexdigest()
+ULTRAHDR_ID = 'UltraHDR-v1'
+ULTRAHDR_SDR_WHITE = 203
+ULTRAHDR_HDR_PEAK = 1000
+ULTRAHDR_KNEE = .5
+ULTRAHDR_GAMMA = 2.2  # Gamma of the Rec.709 RGB24 sent to the SDK.
+REC709_TO_BT2020 = (
+    (.627403896, .329283038, .043313066),
+    (.069097289, .919540395, .011362316),
+    (.016391439, .088013308, .895595253),
+)
+ULTRAHDR_SHA256 = hashlib.sha256(json.dumps([
+    ULTRAHDR_ID, 'positive-log-luminance-gain:smoothstep-maxrgb:zero-offset:linear-strength',
+    ULTRAHDR_SDR_WHITE, ULTRAHDR_HDR_PEAK, ULTRAHDR_KNEE, ULTRAHDR_GAMMA, REC709_TO_BT2020,
+], separators=(',', ':')).encode('ascii')).hexdigest()
+ULTRAHDR_NEEDS_SOURCE = 'UltraHDR requires the matching SDR RGB frame and ungraded TrueHDR output'
 
 
 def mapping_info(name='reference', strength=1.0, skin_strength=None):
     name = name.lower()
     strength = float(strength)
     skin_strength = float((.5 if name=='reference' else 0) if skin_strength is None else skin_strength)
-    if (name not in ('reference', 'neutral', 'natural', 'realdolby') or not np.isfinite(strength) or not 0 <= strength <= 1 or
+    if (name not in MAPPING_NAMES or not np.isfinite(strength) or not 0 <= strength <= 1 or
             not np.isfinite(skin_strength) or not 0 <= skin_strength <= 1):
-        raise ValueError('Brightness mapping must be reference/neutral/natural/realDolby with strength 0..1')
+        raise ValueError('Brightness mapping must be Reference/Neutral/Natural/realDolby/UltraHDR with strength 0..1')
     if name == 'neutral' or strength == 0:
         return dict(name='neutral', strength=0., skin_strength=0., profile_id=None, profile_sha256=None)
     if name == 'natural':
@@ -54,6 +71,11 @@ def mapping_info(name='reference', strength=1.0, skin_strength=None):
         return dict(name=name, strength=strength, skin_strength=skin_strength,
                     profile_id=REAL_DOLBY_ID, profile_sha256=REAL_DOLBY_SHA256,
                     hlg_signal_range='extended', peak_policy='reference_no_1000nit_cap')
+    if name == 'ultrahdr':
+        return dict(name=name, strength=strength, skin_strength=skin_strength,
+                    profile_id=ULTRAHDR_ID, profile_sha256=ULTRAHDR_SHA256,
+                    method='SDR anchored single-channel log2 gain from TrueHDR',
+                    sdr_reference_white_nits=ULTRAHDR_SDR_WHITE, hdr_target_nits=ULTRAHDR_HDR_PEAK)
     return dict(name=name, strength=strength, skin_strength=skin_strength, profile_id=PROFILE_ID, profile_sha256=PROFILE_SHA256)
 
 
@@ -92,6 +114,8 @@ def natural_luminance(xp, nits):
 
 def luminance_lut(size=4096, name='reference'):
     name = name.lower()
+    if name == 'ultrahdr':
+        raise ValueError(ULTRAHDR_NEEDS_SOURCE)
     if name == 'natural':
         result = natural_luminance(np,pq_eotf(np.linspace(0,1,size)))
         result[0] = 0
@@ -125,10 +149,48 @@ def map_display_rgb(xp, rgb, table, strength=1.0):
     return rgb*scale[None,...]
 
 
-def apply_mapping(xp,rgb,tone,table=None):
-    if tone['name']=='realdolby' and table is None:
+@cache
+def _ultrahdr_channels(xp):
+    def grade(r, g, b, hdr_r, hdr_g, hdr_b, out_r, out_g, out_b):
+        r, g, b = (xp.minimum(xp.maximum(value, 0), 1) ** ULTRAHDR_GAMMA for value in (r, g, b))
+        sdr_y = ULTRAHDR_SDR_WHITE * (.2126 * r + .7152 * g + .0722 * b)
+        hdr_y = KR * hdr_r + KG * hdr_g + KB * hdr_b
+        max_boost = ULTRAHDR_HDR_PEAK / ULTRAHDR_SDR_WHITE
+        boost = xp.minimum(xp.maximum(hdr_y / xp.maximum(sdr_y, 1e-6), 1), max_boost)
+        max_sdr = xp.maximum(r, xp.maximum(g, b))
+        t = xp.minimum(xp.maximum((max_sdr - ULTRAHDR_KNEE) / (1 - ULTRAHDR_KNEE), 0), 1)
+        highlight_weight = t * t * (3 - 2 * t)
+        gain = ULTRAHDR_SDR_WHITE * xp.exp2(xp.log2(boost) * highlight_weight)
+        for out, (cr, cg, cb) in zip((out_r, out_g, out_b), REC709_TO_BT2020):
+            xp.multiply(cr * r + cg * g + cb * b, gain, out=out)
+
+    # The GPU evaluates the same equations in one kernel, avoiding full-frame
+    # temporaries for each operation when decoding 4K alongside TrueHDR.
+    return grade if xp is np else xp.fuse(kernel_name='sdr2dv_ultrahdr')(grade)
+
+
+def ultrahdr_grade(xp, sdr_rgb, hdr_rgb):
+    """Map Rec.709 gamma 2.2 SDR and BT.2020 HDR to linear BT.2020 nits.
+
+    The highlight mask grows from half to full linear SDR white, including
+    saturated highlights. A single positive log2 gain preserves SDR colour.
+    """
+    result = xp.empty_like(hdr_rgb)
+    _ultrahdr_channels(xp)(*sdr_rgb, *hdr_rgb, *result)
+    return result
+
+
+def apply_mapping(xp,rgb,tone,table=None,*,sdr_rgb=None):
+    name = tone['name']
+    if name=='realdolby' and table is None:
         raise ValueError('realDolby requires its calibrated luminance LUT')
-    if tone['name']=='natural':
+    if name == 'ultrahdr':
+        if sdr_rgb is None or sdr_rgb.shape != rgb.shape:
+            raise ValueError(ULTRAHDR_NEEDS_SOURCE)
+        graded = ultrahdr_grade(xp, sdr_rgb, rgb)
+        strength = tone['strength']
+        mapped = graded if strength == 1 else rgb + (graded - rgb) * strength
+    elif name=='natural':
         y=xp.maximum(.2627*rgb[0]+.6780*rgb[1]+.0593*rgb[2],0)
         target=y+(natural_luminance(xp,y)-y)*tone['strength']
         scale=xp.where(y>1e-12,target/xp.maximum(y,1e-12),1)
@@ -187,6 +249,8 @@ def write_cube(path, transfer='hlg', strength=1., size=129, skin_strength=None, 
     if size < 2 or size > 256:
         raise ValueError('Cube size must be 2..256')
     tone=mapping_info(mapping,strength,skin_strength)
+    if tone['name']=='ultrahdr':
+        raise ValueError(ULTRAHDR_NEEDS_SOURCE)
     if tone['name']=='realdolby' and transfer=='hlg':
         raise ValueError('realDolby HLG requires the float32 streaming adapter; a nominal-range cube would clip super-whites')
     axis = np.linspace(0,1,size)
@@ -207,7 +271,7 @@ if __name__ == '__main__':
     parser.add_argument('--strength',type=float,default=1.)
     parser.add_argument('--size',type=int,default=129)
     parser.add_argument('--skin-strength',type=float)
-    parser.add_argument('--mode',type=str.lower,choices=['natural','neutral','reference','realdolby'],default='reference')
+    parser.add_argument('--mode',type=str.lower,choices=MAPPING_NAMES,default='reference')
     args = parser.parse_args()
     info = mapping_info(args.mode,args.strength,args.skin_strength)
     if args.describe:

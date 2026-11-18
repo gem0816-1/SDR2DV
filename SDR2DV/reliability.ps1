@@ -287,7 +287,7 @@ function Enter-GpuTaskLock {
 
 function Test-GeneratedVideoName {
     param([string]$Name)
-    return ($Name -match '(?i)(_DV(81|84)|_TrueHDR(_Ref|_Natural|_realDolby)?_HDR10)\.(mp4|mkv)$')
+    return ($Name -match '(?i)(_DV(81|84)|_TrueHDR(_Ref|_Natural|_realDolby|_UltraHDR)?_HDR10)\.(mp4|mkv)$')
 }
 
 function Get-InputBaseName {
